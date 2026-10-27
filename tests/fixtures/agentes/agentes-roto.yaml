@@ -1,0 +1,40 @@
+# RF-01 de spec 0086 (not in this snapshot)
+# Metadatos de los roles neutros (agentes/roles/<rol>.md) y, por agente, cómo
+# se lo invoca. Única fuente de plantillas, modelos y metadatos de rol (8.1).
+# `scripts/agentes generar` arma .claude/agents/<rol>.md con `roles`;
+# `scripts/agentes --lint` valida `agentes` (sin flags que salteen permisos).
+# Valores de texto entre comillas dobles; true/false sin comillas.
+
+roles:
+  planificador:
+    description: "Lee una spec del repo y devuelve un plan de implementación (archivos, CA afectados, casos borde, supuestos). Sólo lectura, nunca edita."
+    claude_tools: "Read, Grep, Glob, Bash"
+  implementador:
+    description: "Implementa un grupo de archivos dentro del §Alcance de una spec del repo. Edita, corre tests locales, no commitea ni pushea."
+    claude_tools: "Read, Grep, Glob, Bash, Edit, Write"
+  verificador:
+    description: "Corre scripts/verify, scripts/spec lint y scripts/doctor sobre una spec y devuelve el desglose por CA, nunca un agregado. Sólo lectura."
+    claude_tools: "Read, Grep, Glob, Bash"
+  refutador:
+    description: "Recibe una afirmación (un CA pasa, un plan cubre un RF) e intenta refutarla con evidencia del repo. Sobre un plan, ante duda refuta; sobre un CA, clasifica en bug/diseno_ca/sin_evidencia. Sólo lectura."
+    claude_tools: "Read, Grep, Glob, Bash"
+
+agentes:
+  claude:
+    bin: "claude"
+    # Centinela: el modelo lo resuelve headless.session_model de
+    # config/rutas.yaml. El camino Claude no lee esta config (RNF-02).
+    model: "headless.session_model"
+    tools: true
+  codex:
+    bin: "codex-inexistente-0086"
+    model: "gpt-5-codex"
+    tools: true
+    # Sin medir contra la CLI real (D3 de 0086): flags tomadas de la
+    # documentación pública de `codex exec`. Al instalarla (por usuario, con
+    # el OK del operador) se mide y se corrige este cmd, sin tocar scripts.
+    cmd: "{bin} exec --model {model} --sandbox workspace-write - < {prompt_file}"
+  ollama:
+    url: "http://localhost:11434"
+    model: "qwen2.5-coder:7b"
+    tools: false

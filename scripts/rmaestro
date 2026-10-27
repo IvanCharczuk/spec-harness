@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# Wrapper de conveniencia sobre RF-02/03/08 de spec 0003 (not in this snapshot) y
+# RF-05/06/07 de spec 0002 (not in this snapshot). Implementado por
+# spec 0012 (not in this snapshot); paso final redefinido por
+# spec 0014 (not in this snapshot) (route decide un modo de trabajo para la
+# sesión actual — ya no lanza scripts/session). No modifica ninguno de esos
+# scripts — sólo los invoca como subprocesos completos.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/routing.sh
+source "$SELF_DIR/lib/routing.sh"
+cd "$REPO_ROOT"
+
+usage() {
+  cat >&2 <<'EOF'
+uso:
+  scripts/rmaestro new "<título>" [--id <NNNN>] [--target-branch <rama>] [opts]
+  scripts/rmaestro <id|ruta> [opts]
+
+opts:
+  --editor <cmd>            override de $EDITOR/$VISUAL/vi (RF-02 de 0012)
+  --context-dir <path>      carpeta de contexto que el agente debe leer (RF-08 de 0012)
+  --routing-config <path>   default: config/routing.yaml
+  --force <A|B> --reason "<texto>"
+                            anulación manual del modo (A=directo, B=exhaustivo),
+                            reenviada a scripts/route
+  --id <NNNN>               (sólo con "new") id reservado, se pasa a scripts/spec new (RF-08 de 0037)
+  --target-branch <rama>    (sólo con "new") rama reservada, se pasa a scripts/spec new (RF-08 de 0037)
+  --target-branch-actual    (sólo con "new") usa la rama actual, se pasa a scripts/spec new (RF-02 de 0039)
+
+salida final (exit 0): MODO=<directo|exhaustivo> CONTRATO=templates/MODE.md.<modo> SPEC=<id>
+EOF
+}
+
+# --- RF-01: invocación y subcomandos ----------------------------------------
+
+[ $# -ge 1 ] || { usage; exit 2; }
+
+case "$1" in
+  -h|--help) usage; exit 0 ;;
+esac
+
+MODE=""
+TITLE=""
+SPEC_ARG=""
+
+if [ "$1" = "new" ]; then
+  MODE=new
+  shift
+  TITLE="${1:-}"
+  [ -n "$TITLE" ] || { echo "rmaestro: new requiere un título no vacío" >&2; usage; exit 2; }
+  shift
+else
+  MODE=resume
+  SPEC_ARG="$1"
+  shift
+fi
+
+EDITOR_OVERRIDE=""
+CONTEXT_DIR=""
+ROUTING_CONFIG="$REPO_ROOT/config/routing.yaml"
+FORCE_TIER=""
+REASON=""
+NEW_ID=""
+NEW_TARGET_BRANCH=""
+NEW_TARGET_BRANCH_ACTUAL=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --editor) EDITOR_OVERRIDE="${2:-}"; shift 2 ;;
+    --context-dir) CONTEXT_DIR="${2:-}"; shift 2 ;;
+    --routing-config) ROUTING_CONFIG="${2:-}"; shift 2 ;;
+    --force) FORCE_TIER="${2:-}"; shift 2 ;;
+    --reason) REASON="${2:-}"; shift 2 ;;
+    --id) NEW_ID="${2:-}"; shift 2 ;;
+    --target-branch) NEW_TARGET_BRANCH="${2:-}"; shift 2 ;;
+    --target-branch-actual) NEW_TARGET_BRANCH_ACTUAL=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "rmaestro: argumento desconocido: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+# --- RF-08: --context-dir, validado antes de arrancar cualquier paso -------
+
+if [ -n "$CONTEXT_DIR" ]; then
+  [ -d "$CONTEXT_DIR" ] || {
+    echo "rmaestro: --context-dir no existe o no es una carpeta: '$CONTEXT_DIR'" >&2
+    exit 2
+  }
+fi
+
+# id canónico — misma normalización que spec_id_of en scripts/spec (0003)
+spec_id_of() {
+  local file="$1" id
+  id="$(basename "$file" | grep -oE '^[0-9]{4}' || true)"
+  if [ -n "$id" ]; then printf '%s' "$id"; else basename "$file" .md; fi
+}
+
+# --- RF-02: paso "editar" — bloqueo síncrono en $EDITOR ---------------------
+
+run_editor() {
+  local file="$1" cmd
+  if [ -n "$EDITOR_OVERRIDE" ]; then
+    cmd="$EDITOR_OVERRIDE"
+  elif [ -n "${VISUAL:-}" ]; then
+    cmd="$VISUAL"
+  elif [ -n "${EDITOR:-}" ]; then
+    cmd="$EDITOR"
+  else
+    cmd="vi"
+  fi
+  "$cmd" "$file"
+}
+
+# --- helper de confirmación (RNF-04: prompts en español, formato [s/N]) ----
+
+ask_confirm() {
+  local prompt="$1" ans=""
+  printf '%s' "$prompt"
+  IFS= read -r ans || ans=""
+  case "$ans" in
+    s|S) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- RF-08 de 0039: "apruebo" vale como s/S en el prompt de aprobación -----
+# Usado únicamente por confirm_and_approve; ask_confirm (arriba) sigue
+# aceptando sólo s/S para "¿Reabrir el editor?". Normaliza con
+# tr '[:upper:]' '[:lower:]' y recorta espacios — nada de ${ans,,}
+# (bash 3.2 de la Mac no lo soporta).
+
+ask_approve() {
+  local prompt="$1" ans=""
+  printf '%s' "$prompt"
+  IFS= read -r ans || ans=""
+  ans="$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')"
+  ans="${ans#"${ans%%[![:space:]]*}"}"
+  ans="${ans%"${ans##*[![:space:]]}"}"
+  case "$ans" in
+    s|apruebo) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- RF-03: bucle de lint con reintento de edición --------------------------
+# force_first_edit=1 (camino "new"): el editor se abre una vez sin condición,
+# porque el template recién instanciado nunca es contenido real, aunque
+# pase lint de pura casualidad estructural. force_first_edit=0 (camino
+# "resume" sobre un draft preexistente): se corre lint primero — si ya
+# pasa, no se abre el editor (RF-05, idempotencia).
+
+edit_lint_loop() {
+  local file="$1" force_first_edit="$2"
+
+  if [ "$force_first_edit" -eq 1 ]; then
+    run_editor "$file"
+  fi
+
+  while true; do
+    local lint_rc=0 lint_out
+    lint_out="$("$REPO_ROOT/scripts/spec" lint "$file" 2>&1)" || lint_rc=$?
+    if [ "$lint_rc" -eq 0 ]; then
+      return 0
+    fi
+    printf '%s\n' "$lint_out"
+    if ask_confirm "¿Reabrir el editor para corregir? [s/N] "; then
+      run_editor "$file"
+    else
+      exit 130
+    fi
+  done
+}
+
+# --- RF-04: confirmación antes de approve -----------------------------------
+
+confirm_and_approve() {
+  local file="$1" id="$2" prompt rc=0
+
+  prompt="$(printf "lint está en verde. ¿Aprobar '%s' (draft → approved, esto commitea)? [s/N] " "$id")"
+  if ask_approve "$prompt"; then
+    "$REPO_ROOT/scripts/spec" approve "$file" || rc=$?
+    [ "$rc" -eq 0 ] || exit 1
+  else
+    exit 130
+  fi
+}
+
+# --- RF-08: bloque informativo de --context-dir -----------------------------
+
+print_context_dir_block() {
+  local dir="$1" abs name
+  abs="$(cd "$dir" && pwd)"
+  echo "Carpeta de contexto: $abs"
+  echo "Archivos:"
+  for name in $(ls -A "$dir" 2>/dev/null | sort); do
+    if [ -d "$dir/$name" ]; then
+      echo "  - $name/ (carpeta, no se explora)"
+    else
+      echo "  - $name"
+    fi
+  done
+  cat <<'EOF'
+Leé estos archivos completos antes de tocar código; son contexto que el
+operador pidió tener en cuenta para esta spec.
+EOF
+}
+
+# --- RF-03/RF-06 de 0014: route + modo de trabajo (reemplaza RF-07 de 0012) --
+# No hay confirmación: adoptar un modo no es irreversible (no commitea, no
+# lanza procesos, no consume cuota). El agente de la sesión actual lee el
+# contrato impreso en CONTRATO= y lo adopta — no se abre ninguna otra sesión.
+
+route_and_mode() {
+  local file="$1" id="$2"
+  local route_rc=0 route_out
+  local route_args=(--spec "$file" --routing-config "$ROUTING_CONFIG")
+  if [ -n "$FORCE_TIER" ]; then
+    route_args+=(--force "$FORCE_TIER" --reason "$REASON")
+  fi
+
+  route_out="$("$REPO_ROOT/scripts/route" "${route_args[@]}")" || route_rc=$?
+  printf '%s\n' "$route_out"
+  [ "$route_rc" -eq 0 ] || exit 1
+
+  if [ -n "$CONTEXT_DIR" ]; then
+    print_context_dir_block "$CONTEXT_DIR"
+  fi
+
+  local tier_letter modo
+  tier_letter="$(printf '%s\n' "$route_out" | grep -oE 'TIER=[AB]' | head -1 | cut -d= -f2)"
+  case "$tier_letter" in
+    A) modo=directo ;;
+    B) modo=exhaustivo ;;
+    *) echo "rmaestro: no se pudo determinar el tier de la salida de route" >&2; exit 1 ;;
+  esac
+
+  printf 'MODO=%s CONTRATO=templates/MODE.md.%s SPEC=%s\n' "$modo" "$modo" "$id"
+  exit 0
+}
+
+# --- RF-05: dispatch principal, idempotente por status ----------------------
+
+if [ "$MODE" = "new" ]; then
+  NEW_ARGS=()
+  [ -z "$NEW_ID" ] || NEW_ARGS+=(--id "$NEW_ID")
+  [ -z "$NEW_TARGET_BRANCH" ] || NEW_ARGS+=(--target-branch "$NEW_TARGET_BRANCH")
+  [ -z "$NEW_TARGET_BRANCH_ACTUAL" ] || NEW_ARGS+=(--target-branch-actual)
+  SPEC_FILE="$("$REPO_ROOT/scripts/spec" new "$TITLE" ${NEW_ARGS[@]+"${NEW_ARGS[@]}"})"
+  echo "Spec creada: $SPEC_FILE"
+  ID="$(spec_id_of "$SPEC_FILE")"
+  edit_lint_loop "$SPEC_FILE" 1
+  confirm_and_approve "$SPEC_FILE" "$ID"
+  route_and_mode "$SPEC_FILE" "$ID"
+else
+  if ! SPEC_FILE="$(resolve_spec "$SPEC_ARG")" || [ ! -f "$SPEC_FILE" ]; then
+    echo "rmaestro: no se pudo resolver spec '$SPEC_ARG'" >&2
+    exit 2
+  fi
+  ID="$(spec_id_of "$SPEC_FILE")"
+  STATUS="$(fm_field "$SPEC_FILE" status)"
+
+  case "$STATUS" in
+    draft)
+      edit_lint_loop "$SPEC_FILE" 0
+      confirm_and_approve "$SPEC_FILE" "$ID"
+      route_and_mode "$SPEC_FILE" "$ID"
+      ;;
+    approved|implementing)
+      route_and_mode "$SPEC_FILE" "$ID"
+      ;;
+    verified|archived)
+      echo "rmaestro: la spec '$ID' ya está en estado '$STATUS'; el flujo de rmaestro no aplica" >&2
+      exit 0
+      ;;
+    *)
+      # D5: no se duplica la validación de status — se delega en spec lint,
+      # que ya rechaza cualquier valor fuera del enum, y se refleja su exit.
+      "$REPO_ROOT/scripts/spec" lint "$SPEC_FILE"
+      exit $?
+      ;;
+  esac
+fi

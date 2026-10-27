@@ -1,0 +1,6 @@
+MODO=directo
+SPEC=0028
+WORKFLOW=<REPO_ROOT>/.claude/workflows/ruta-directo.js
+ARGS={"spec":"0028","perfiles":{"banda":"directo","panel":{"planificadores":1,"refutadores_por_plan":1},"planificador":{"model":"sonnet","effort":"medium"},"implementador":{"model":"sonnet","effort":"medium"},"verificador":{"model":"haiku","effort":"low"},"refutador":{"model":"haiku","effort":"low"},"sintesis":{"model":"opus","effort":"medium"}}}
+PROMPT=Ejecutá la herramienta Workflow con scriptPath=<REPO_ROOT>/.claude/workflows/ruta-directo.js y args={"spec":"0028","perfiles":{"banda":"directo","panel":{"planificadores":1,"refutadores_por_plan":1},"planificador":{"model":"sonnet","effort":"medium"},"implementador":{"model":"sonnet","effort":"medium"},"verificador":{"model":"haiku","effort":"low"},"refutador":{"model":"haiku","effort":"low"},"sintesis":{"model":"opus","effort":"medium"}}}. No uses ninguna otra herramienta ni modifiques el script. Cuando la herramienta termine, respondé sólo: listo.
+CMD=CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 printf '%s' "$PROMPT" | claude -p --setting-sources project --strict-mcp-config --model claude-haiku-4-5-20251001 --permission-mode acceptEdits --allowedTools Workflow --max-turns 6 --output-format stream-json --verbose

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(scripts/spec *)",
+      "Bash(curl *)",
+      "Read(/private/tmp/claude-scratch/**)"
+    ],
+    "deny": [
+      "Bash(git checkout *)",
+      "Bash(git switch *)",
+      "Bash(git stash *)",
+      "Bash(git stash)",
+      "Bash(git restore *)",
+      "Bash(git reset --hard *)",
+      "Bash(git reset --hard)",
+      "Bash(git clean *)",
+      "Bash(git rebase *)",
+      "Bash(env)",
+      "Bash(printenv *)",
+      "Bash(printenv)"
+    ]
+  }
+}

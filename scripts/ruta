@@ -1,0 +1,1038 @@
+#!/usr/bin/env bash
+# RF-01..RF-06 de spec 0030 (not in this snapshot)
+#
+# Corre una ruta agentica (scripts/rutas <modo>, scripts/rutas perfiles) desde
+# cualquier terminal: lanza el workflow en una sesion headless (`claude -p`)
+# de un solo turno con la herramienta Workflow, lee el resultado del
+# `output_file` que escribe el harness (nunca la prosa del modelo) y registra
+# la corrida sola con `scripts/rutas log`. No reimplementa nada de eso: los
+# cuatro workflows y los cinco perfiles siguen siendo el unico contrato
+# (D1 de 0030).
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/routing.sh
+# Sourceado solo para heredar resolve_spec/fm_field (viven en lib/spec.sh,
+# que routing.sh ya sourcea) — mismo motivo que scripts/rutas. Ninguno de
+# los dos libs se modifica (RNF-03).
+source "$SELF_DIR/lib/routing.sh"
+cd "$REPO_ROOT"
+
+RUTAS_CONFIG="config/rutas.yaml"
+DEFAULT_REGISTRO="sessions/rutas.jsonl"
+
+usage() {
+  cat >&2 <<'USAGE'
+uso:
+  scripts/ruta <directo|exhaustivo> <spec> [--fase plan|impl] [--plan <json>]
+               [--dry-run] [--registro <path>] [--claude <cmd>] [--notas "<texto>"]
+               [--config <path>]
+               [--agent <agente>]
+
+  directo:    un solo workflow, sin --fase.
+  exhaustivo: --fase plan (default) corre el primer workflow y guarda el
+              plan; --fase impl --plan <json> corre el segundo con ese plan.
+              Nunca encadena las dos fases en una corrida.
+
+  --dry-run   resuelve todo (workflow, perfiles, args, comando claude,
+              prompt) y lo imprime sin ejecutar nada ni escribir el registro.
+  --claude    binario a usar en vez de "claude" (fixtures de test).
+  --registro  registro a usar en vez de sessions/rutas.jsonl.
+  --config    config/rutas.yaml a usar en vez del default (fixtures de test).
+  --agent     agente de config/agentes.yaml (o de $AGENTES_CONFIG); default
+              claude, que es el camino de siempre y no lee esa config. Con
+              otro agente (RF-04 a RF-08 de specs/0086) sólo vale directo:
+              el implementador corre en esa herramienta, scripts/verify
+              juzga, hay una sola segunda vuelta si queda algún [FAIL] y se
+              registra con --workflow ruta-directo.js. --claude se ignora.
+
+exit: 0 ok | 2 uso / modo o flag desconocida / spec inexistente / --fase
+  invalida / spec no esta en implementing / headless mal configurado
+  | 3 la sesion termino sin completar (denegacion, error, sin notificacion):
+  no se registra nada
+  con --agent <no-claude>: 2 también por agente desconocido, exhaustivo o
+  binario/url ausente; 3 si la herramienta falla o se pasa del tope, si
+  pedir falla, si un path de la respuesta no está permitido o si el
+  agente commiteó (no se revierte nada)
+USAGE
+}
+
+print_manual() { printf '[MANUAL] %s\n' "$1"; }
+
+# --- RF-01: interfaz y guardas, en el orden fijado por la spec --------------
+
+[ $# -ge 1 ] || { usage; exit 2; }
+MODE="$1"; shift
+case "$MODE" in
+  directo|exhaustivo) : ;;
+  *) echo "ruta: modo desconocido '$MODE'" >&2; usage; exit 2 ;;
+esac
+
+[ $# -ge 1 ] || { usage; exit 2; }
+SPEC_ARG="$1"; shift
+case "$SPEC_ARG" in
+  --*) echo "ruta: falta <spec>" >&2; usage; exit 2 ;;
+esac
+
+FASE=""
+PLAN_ARG=""
+DRY_RUN=0
+REGISTRO="$DEFAULT_REGISTRO"
+CLAUDE_BIN="claude"
+NOTAS_ARG=""
+AGENT=claude
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --fase)
+      [ $# -ge 2 ] || { echo "ruta: --fase requiere un valor" >&2; usage; exit 2; }
+      FASE="$2"; shift 2 ;;
+    --plan)
+      [ $# -ge 2 ] || { echo "ruta: --plan requiere un valor" >&2; usage; exit 2; }
+      PLAN_ARG="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --registro)
+      [ $# -ge 2 ] || { echo "ruta: --registro requiere un valor" >&2; usage; exit 2; }
+      REGISTRO="$2"; shift 2 ;;
+    --claude)
+      [ $# -ge 2 ] || { echo "ruta: --claude requiere un valor" >&2; usage; exit 2; }
+      CLAUDE_BIN="$2"; shift 2 ;;
+    --notas)
+      [ $# -ge 2 ] || { echo "ruta: --notas requiere un valor" >&2; usage; exit 2; }
+      NOTAS_ARG="$2"; shift 2 ;;
+    --config)
+      [ $# -ge 2 ] || { echo "ruta: --config requiere un valor" >&2; usage; exit 2; }
+      RUTAS_CONFIG="$2"; shift 2 ;;
+    --agent)
+      { [ $# -ge 2 ] && [ -n "$2" ]; } || { echo "ruta: --agent requiere un valor" >&2; usage; exit 2; }
+      AGENT="$2"; shift 2 ;;
+    *) echo "ruta: flag desconocida '$1'" >&2; usage; exit 2 ;;
+  esac
+done
+
+# --- RF-04 de specs/0086: --agent <no-claude>, guardas 1 y 2 ---------------
+# Van antes de las guardas de hoy (orden de RF-04). Con --agent claude este
+# bloque no corre y config/agentes.yaml no se lee: el camino de siempre no
+# depende de esa config (RNF-02 de 0086).
+
+AGENTES_CFG="${AGENTES_CONFIG:-config/agentes.yaml}"
+
+# Claves de agente bajo `agentes:` (indentación de 2, C2 de 0086).
+agentes_keys() {
+  awk '
+    /^[^[:space:]#]/ { top = $0; sub(/:.*/, "", top); ina = (top == "agentes"); next }
+    ina && /^  [^[:space:]#]/ { k = $0; sub(/^  /, "", k); sub(/:.*/, "", k); print k }
+  ' "$1"
+}
+
+# agente_field <cfg> <agente> <campo>: valor de agentes.<agente>.<campo>.
+# Entre comillas dobles se toma literal; sin comillas se corta el
+# comentario. Exit 1 si el campo no está.
+agente_field() {
+  awk -v a="$2" -v f="$3" '
+    /^[^[:space:]#]/ { top = $0; sub(/:.*/, "", top); ina = (top == "agentes"); cur = ""; next }
+    ina && /^  [^[:space:]#]/ { k = $0; sub(/^  /, "", k); sub(/:.*/, "", k); cur = k; next }
+    ina && cur == a && /^    [^[:space:]#]/ {
+      line = $0; sub(/^    /, "", line); k = line; sub(/:.*/, "", k)
+      if (k != f) next
+      v = line; sub(/^[^:]*:[[:space:]]*/, "", v)
+      if (substr(v, 1, 1) == "\"") {
+        v = substr(v, 2); i = index(v, "\""); if (i > 0) v = substr(v, 1, i - 1)
+      } else {
+        sub(/[[:space:]]*#.*/, "", v); sub(/[[:space:]]+$/, "", v)
+      }
+      print v; found = 1; exit
+    }
+    END { exit (found ? 0 : 1) }
+  ' "$1"
+}
+
+if [ "$AGENT" != "claude" ]; then
+  [ -f "$AGENTES_CFG" ] || { echo "ruta: falta $AGENTES_CFG" >&2; exit 2; }
+  # Comparación exacta (`CLAUDE` no es `claude`), sin pipe a grep -q: con
+  # pipefail, un SIGPIPE del awk daría "desconocido" a un agente válido.
+  AGENT_KNOWN=0
+  while IFS= read -r akey; do
+    [ "$akey" = "$AGENT" ] && AGENT_KNOWN=1
+  done <<< "$(agentes_keys "$AGENTES_CFG")"
+  if [ "$AGENT_KNOWN" -ne 1 ]; then
+    echo "ruta: agente desconocido '$AGENT'" >&2
+    exit 2
+  fi
+  if [ "$MODE" != "directo" ]; then
+    echo "ruta: exhaustivo sólo con --agent claude en esta versión" >&2
+    exit 2
+  fi
+fi
+
+# Guarda 2: spec inexistente.
+if ! SPECFILE="$(resolve_spec "$SPEC_ARG" 2>/dev/null)" || [ ! -f "$SPECFILE" ]; then
+  echo "ruta: spec '$SPEC_ARG' inexistente" >&2
+  exit 2
+fi
+
+# RF-06 de specs/0034: el harness no deja editar .claude/ en claude -p
+# aunque haya reglas explicitas (medido en 0036). Si el bloque de §5.1
+# nombra rutas bajo .claude/, se avisa antes de lanzar y se sigue: el resto
+# lo puede hacer la ruta y esa parte se termina desde una sesion.
+CLAUDE_PATHS="$(awk '
+  /^### 5\.1/ { in51 = 1; next }
+  in51 && /^###? / { exit }
+  in51 && /^```/ { fence = !fence; next }
+  in51 && fence { print $1 }
+' "$SPECFILE" | { grep '^\.claude/' || true; } | tr '\n' ' ' | sed 's/ $//')"
+if [ -n "$CLAUDE_PATHS" ]; then
+  echo "ruta: aviso: §5.1 toca .claude/ ($CLAUDE_PATHS); el harness no deja editarlas en claude -p (medido en 0036): esa parte se termina desde una sesion" >&2
+fi
+
+# Guarda 3: --fase invalida / impl sin --plan (directo no usa --fase).
+case "$MODE" in
+  directo)
+    if [ -n "$FASE" ]; then
+      echo "ruta: --fase no aplica al modo directo" >&2
+      usage; exit 2
+    fi
+    ;;
+  exhaustivo)
+    if [ -n "$FASE" ] && [ "$FASE" != "plan" ] && [ "$FASE" != "impl" ]; then
+      echo "ruta: --fase invalida '$FASE' (valores: plan|impl)" >&2
+      usage; exit 2
+    fi
+    if [ "$FASE" = "impl" ] && [ -z "$PLAN_ARG" ]; then
+      echo "ruta: --fase impl requiere --plan <json>" >&2
+      usage; exit 2
+    fi
+    [ -n "$FASE" ] || FASE="plan"
+    ;;
+esac
+
+# Guarda 4 (ultima): estado de la spec. No aplica con --dry-run ni en modo
+# prueba (--claude Y --registro, los dos distintos del default — v2, D10):
+# asi corren los CA contra 0028, que esta verified, y el script nunca toca
+# el registro real en modo prueba.
+MODO_PRUEBA=0
+if [ "$CLAUDE_BIN" != "claude" ] && [ "$REGISTRO" != "$DEFAULT_REGISTRO" ]; then
+  MODO_PRUEBA=1
+fi
+if [ "$DRY_RUN" -eq 0 ] && [ "$MODO_PRUEBA" -eq 0 ]; then
+  ESTADO="$(fm_field "$SPECFILE" status)"
+  if [ "$ESTADO" != "implementing" ]; then
+    echo "ruta: la spec $SPEC_ARG está en $ESTADO, corré scripts/spec start $SPEC_ARG" >&2
+    exit 2
+  fi
+fi
+
+# --- RF-02: config headless (config/rutas.yaml), awk plano, sin defaults ---
+
+headless_field() {
+  local file="$1" key="$2"
+  awk -v k="$key" '
+    /^headless:[[:space:]]*$/ { inh=1; next }
+    inh && /^[^[:space:]#]/ { inh=0 }
+    inh && $0 ~ "^[[:space:]]+"k":" {
+      v=$0; sub("^[[:space:]]+"k":[[:space:]]*", "", v); sub(/[[:space:]]*#.*/, "", v); gsub(/^"|"$/, "", v); print v; exit
+    }
+  ' "$file"
+}
+
+SESSION_MODEL="$(headless_field "$RUTAS_CONFIG" session_model)"
+[ -n "$SESSION_MODEL" ] || { echo "ruta: falta headless.session_model en $RUTAS_CONFIG" >&2; exit 2; }
+PERMISSION_MODE="$(headless_field "$RUTAS_CONFIG" permission_mode)"
+[ -n "$PERMISSION_MODE" ] || { echo "ruta: falta headless.permission_mode en $RUTAS_CONFIG" >&2; exit 2; }
+MAX_TURNS="$(headless_field "$RUTAS_CONFIG" max_turns)"
+[ -n "$MAX_TURNS" ] || { echo "ruta: falta headless.max_turns en $RUTAS_CONFIG" >&2; exit 2; }
+SETTING_SOURCES="$(headless_field "$RUTAS_CONFIG" setting_sources)"
+[ -n "$SETTING_SOURCES" ] || { echo "ruta: falta headless.setting_sources en $RUTAS_CONFIG" >&2; exit 2; }
+# RF-01/RF-02 de specs/0034: rutas de mas de 10 minutos y sin el corte a los
+# 600s de "claude -p" (0033). bg_wait_ms va al harness vía la variable de
+# entorno que el propio mensaje de corte de claude -p sugiere (D1 de 0034);
+# timeout_min es el tope propio que aplica RF-02 mas abajo.
+BG_WAIT_MS="$(headless_field "$RUTAS_CONFIG" bg_wait_ms)"
+[ -n "$BG_WAIT_MS" ] || { echo "ruta: falta headless.bg_wait_ms en $RUTAS_CONFIG" >&2; exit 2; }
+TIMEOUT_MIN="$(headless_field "$RUTAS_CONFIG" timeout_min)"
+[ -n "$TIMEOUT_MIN" ] || { echo "ruta: falta headless.timeout_min en $RUTAS_CONFIG" >&2; exit 2; }
+
+SPEC_ID="$(basename "$SPECFILE" | grep -oE '^[0-9]{4}' || true)"
+[ -n "$SPEC_ID" ] || SPEC_ID="$(basename "$SPECFILE" .md)"
+
+# --- RF-05 a RF-08 de specs/0086: camino de un agente que no es Claude ------
+# Sólo directo (la guarda de arriba ya cortó exhaustivo). El camino Claude de
+# más abajo (prompt Workflow, CMD=, tope, lectura del output_file) no se
+# toca: esta rama sale antes, con su propio exit. Decisiones:
+# - el stdout de la herramienta externa va a stderr, así el stdout de ruta
+#   queda en líneas de CA + RUTA= + la línea JSON de rutas log;
+# - --claude no aplica acá y se ignora;
+# - una spec sin ningún CA ejecutable da CA_TOTAL=0 y pasa=true (RF-08.3);
+# - la herramienta que sale con exit != 0 o por el tope da exit 3 sin verify
+#   y sin registro, igual que un claude -p fallido.
+
+# Schema de la respuesta sin herramientas (RF-07), enviado tal cual como
+# `format`. pedir valida el subconjunto; los elementos los valida ruta.
+RUTA_EXT_SCHEMA='{"type":"object","required":["archivos","resumen"],"properties":{"archivos":{"type":"array","items":{"type":"object","required":["path","contenido"],"properties":{"path":{"type":"string"},"contenido":{"type":"string"}}}},"resumen":{"type":"string"}}}'
+
+ruta_ext_falta() {
+  echo "ruta: falta agentes.$AGENT.$1 en $AGENTES_CFG" >&2
+  exit 2
+}
+
+# Reemplaza {bin}, {model} y {prompt_file} en una sola pasada (node, no
+# ${var//}: en bash 5.2 `&` es especial en el reemplazo y en 3.2 no).
+ruta_ext_cmd() {
+  node -e '
+    const [t, bin, model, prompt_file] = process.argv.slice(1);
+    const v = { bin, model, prompt_file };
+    process.stdout.write(t.replace(/\{(bin|model|prompt_file)\}/g, (_, k) => v[k]));
+  ' -- "$1" "$2" "$3" "$4"
+}
+
+# Allowlist de RF-07: entradas no indentadas del fence de §5.1. Es una copia
+# del awk de CLAUDE_PATHS (que sigue intacto) con el filtro de indentación:
+# los hijos indentados no habilitan nombres sueltos en la raíz.
+ruta_ext_allow() {
+  awk '
+    /^### 5\.1/ { in51 = 1; next }
+    in51 && /^###? / { exit }
+    in51 && /^```/ { fence = !fence; next }
+    in51 && fence && /^[^[:space:]]/ { print $1 }
+  ' "$SPECFILE"
+}
+
+# Valida todos los paths de la respuesta de pedir y, sólo si pasan todos,
+# escribe cada archivo con su contenido exacto. Si uno falla, no escribe
+# ninguno, lo nombra por stderr y sale con 3.
+RUTA_EXT_ESCRIBIR_SRC="$(cat <<'NODEEOF'
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const [root, outFile, allowRaw] = process.argv.slice(1);
+const fail = (msg) => { process.stderr.write('ruta: ' + msg + '\n'); process.exit(3); };
+let obj;
+try { obj = JSON.parse(fs.readFileSync(outFile, 'utf8').trim()); } catch (e) { fail('la salida de pedir no es JSON'); }
+const r = obj && obj.respuesta;
+if (!r || typeof r !== 'object' || !Array.isArray(r.archivos)) fail('la respuesta no trae archivos[]');
+const allow = allowRaw.split('\n').filter(Boolean);
+const allowed = (p) => allow.some((a) => (a.endsWith('/') ? p.startsWith(a) : p === a));
+let rootReal;
+try { rootReal = fs.realpathSync(root); } catch (e) { fail('no se pudo resolver el worktree'); }
+const inside = (real) => real === rootReal || real.startsWith(rootReal + path.sep);
+const seen = new Set();
+const plan = [];
+r.archivos.forEach((it, i) => {
+  if (!it || typeof it !== 'object' || typeof it.path !== 'string' || typeof it.contenido !== 'string') {
+    fail('path fuera de lo permitido: archivos[' + i + '] sin path o contenido de tipo string');
+  }
+  const raw = it.path;
+  const bad = () => fail('path fuera de lo permitido: ' + raw);
+  if (raw === '' || raw.startsWith('/') || raw.endsWith('/') || raw.includes('\0')) bad();
+  const segs = raw.split('/');
+  // .git comparado sin mayúsculas: en macOS el filesystem no las distingue.
+  if (segs.some((s) => s === '..' || s.toLowerCase() === '.git')) bad();
+  const norm = segs.filter((s) => s !== '' && s !== '.').join('/');
+  if (norm === '' || seen.has(norm)) bad();
+  seen.add(norm);
+  if (!allowed(norm)) bad();
+  const abs = path.join(rootReal, norm);
+  let dir = path.dirname(abs);
+  while (!fs.existsSync(dir)) dir = path.dirname(dir);
+  let dirReal;
+  try { dirReal = fs.realpathSync(dir); } catch (e) { bad(); }
+  if (!inside(dirReal) || !fs.statSync(dirReal).isDirectory()) bad();
+  let st = null;
+  try { st = fs.lstatSync(abs); } catch (e) { st = null; }
+  if (st && st.isDirectory()) bad();
+  if (st && st.isSymbolicLink()) {
+    let t;
+    try { t = fs.realpathSync(abs); } catch (e) { bad(); }
+    if (!inside(t)) bad();
+  }
+  plan.push([abs, it.contenido, norm]);
+});
+for (const [abs, contenido, norm] of plan) {
+  try {
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, contenido);
+  } catch (e) { fail('no se pudo escribir ' + norm + ' (' + e.code + ')'); }
+  process.stderr.write('ruta: escrito ' + norm + '\n');
+}
+process.exit(0);
+NODEEOF
+)"
+
+# Una vuelta del implementador con el prompt de $1. Sale con 3 si la
+# herramienta falla, se pasa del tope, pedir falla o un path no se permite.
+ruta_ext_vuelta() {
+  local pf="$1" rc real pid timed_out start_secs timeout_secs
+  if [ "$EXT_TOOLS" = "true" ]; then
+    # Valores con %q: la plantilla lleva `<` y REPO_ROOT puede tener espacios.
+    real="$(ruta_ext_cmd "$EXT_CMD" "$(printf '%q' "$EXT_BIN")" "$(printf '%q' "$EXT_MODEL")" "$(printf '%q' "$pf")")"
+    timeout_secs=$(( TIMEOUT_MIN * 60 ))
+    set +e
+    # exec: el PID vigilado es el de la CLI, no un bash intermedio que
+    # dejaría vivo al hijo después del kill. Sin disown: wait tiene que
+    # devolver el exit real de la CLI (con disown, bash da 0).
+    bash -c "exec $real" >&2 &
+    pid=$!
+    timed_out=0
+    # Mismo vigilante que el camino Claude (RF-02 de 0034), reloj $SECONDS.
+    start_secs=$SECONDS
+    while kill -0 "$pid" 2>/dev/null; do
+      if [ $(( SECONDS - start_secs )) -ge "$timeout_secs" ]; then
+        timed_out=1
+        kill "$pid" 2>/dev/null || true
+        for _ in 1 2 3 4 5; do
+          kill -0 "$pid" 2>/dev/null || break
+          sleep 1
+        done
+        kill -9 "$pid" 2>/dev/null || true
+        break
+      fi
+      sleep 1
+    done
+    wait "$pid" 2>/dev/null
+    rc=$?
+    set -e
+    if [ "$timed_out" -eq 1 ]; then
+      echo "ruta: timeout de ${TIMEOUT_MIN} min" >&2
+      exit 3
+    fi
+    if [ "$rc" -ne 0 ]; then
+      echo "ruta: '$EXT_BIN' salió con $rc; no se corre verify ni se registra" >&2
+      exit 3
+    fi
+  else
+    rc=0
+    node "$SELF_DIR/agentes" pedir --agente "$AGENT" --model "$EXT_MODEL" --url "$EXT_URL" \
+      --prompt-file "$pf" --schema "$EXT_TMPDIR/schema.json" > "$EXT_TMPDIR/pedir.json" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      echo "ruta: pedir salió con $rc" >&2
+      exit 3
+    fi
+    node -e "$RUTA_EXT_ESCRIBIR_SRC" -- "$REPO_ROOT" "$EXT_TMPDIR/pedir.json" "$EXT_ALLOW" || exit 3
+  fi
+}
+
+# RF-08.5: si el agente commiteó, no se revierte nada y se sale con 3.
+ruta_ext_head() {
+  local now
+  now="$(git rev-parse HEAD 2>/dev/null)" || { echo "ruta: no se pudo leer HEAD" >&2; exit 3; }
+  if [ "$now" != "$HEAD0" ]; then
+    echo "ruta: el agente commiteó (HEAD $HEAD0 -> $now); no se revierte nada" >&2
+    exit 3
+  fi
+}
+
+# RF-08.1: verify es el juez. Exit 1 (hay [FAIL]) es normal; 2 o más es que
+# la spec no resuelve: exit 3 sin registrar, no 0 CA con pasa=true.
+ruta_ext_verify() {
+  local rc=0
+  "$SELF_DIR/verify" "$SPEC_ID" > "$1" || rc=$?
+  if [ "$rc" -ge 2 ]; then
+    echo "ruta: scripts/verify $SPEC_ID salió con $rc" >&2
+    exit 3
+  fi
+}
+
+correr_agente_externo() {
+  local vf vuelta_pf
+  EXT_MODEL="$(agente_field "$AGENTES_CFG" "$AGENT" model)" && [ -n "$EXT_MODEL" ] || ruta_ext_falta model
+  EXT_TOOLS="$(agente_field "$AGENTES_CFG" "$AGENT" tools)" || ruta_ext_falta tools
+  case "$EXT_TOOLS" in true|false) : ;; *) ruta_ext_falta tools ;; esac
+  # RF-06b (v2): sin herramientas, el prompt suma §5.1 y los cmd de los CA.
+  EXT_PROMPT_FLAGS=""
+  [ "$EXT_TOOLS" = "false" ] && EXT_PROMPT_FLAGS="--sin-herramientas"
+  EXT_BIN=""; EXT_CMD=""; EXT_URL=""
+  if [ "$EXT_TOOLS" = "true" ]; then
+    EXT_BIN="$(agente_field "$AGENTES_CFG" "$AGENT" bin)" && [ -n "$EXT_BIN" ] || ruta_ext_falta bin
+    EXT_CMD="$(agente_field "$AGENTES_CFG" "$AGENT" cmd)" && [ -n "$EXT_CMD" ] || ruta_ext_falta cmd
+  else
+    EXT_URL="$(agente_field "$AGENTES_CFG" "$AGENT" url)" && [ -n "$EXT_URL" ] || ruta_ext_falta url
+  fi
+
+  # Guarda de estado de hoy, pero sin mirar MODO_PRUEBA: así --claude X
+  # --registro Y no la saltea con un agente externo.
+  if [ "$DRY_RUN" -eq 0 ]; then
+    ESTADO="$(fm_field "$SPECFILE" status)"
+    if [ "$ESTADO" != "implementing" ]; then
+      echo "ruta: la spec $SPEC_ARG está en $ESTADO, corré scripts/spec start $SPEC_ARG" >&2
+      exit 2
+    fi
+  fi
+
+  # RF-05: --dry-run determinístico y sin efectos (sin guarda 4, sin
+  # temporales, sin red, sin registro). El sha se toma del stdout de prompt
+  # por un pipe, nunca por $(), que comería los \n finales.
+  if [ "$DRY_RUN" -eq 1 ]; then
+    local sha cmd_line
+    sha="$(node "$SELF_DIR/agentes" prompt --rol implementador --spec "$SPEC_ID" $EXT_PROMPT_FLAGS | node -e '
+      const h = require("crypto").createHash("sha256");
+      process.stdin.on("data", (d) => h.update(d));
+      process.stdin.on("end", () => process.stdout.write(h.digest("hex")));
+    ')" || { echo "ruta: scripts/agentes prompt falló para $SPEC_ID" >&2; exit 2; }
+    if [ "$EXT_TOOLS" = "true" ]; then
+      cmd_line="$(ruta_ext_cmd "$EXT_CMD" "$EXT_BIN" "$EXT_MODEL" "<PROMPT_FILE>")"
+    else
+      cmd_line="scripts/agentes pedir --agente $AGENT --model $EXT_MODEL --url $EXT_URL --prompt-file <PROMPT_FILE> --schema <SCHEMA_FILE>"
+    fi
+    printf 'MODO=%s\n' "$MODE"
+    printf 'SPEC=%s\n' "$SPEC_ID"
+    printf 'AGENTE=%s\n' "$AGENT"
+    printf 'MODEL=%s\n' "$EXT_MODEL"
+    printf 'PROMPT_SHA=%s\n' "$sha"
+    printf 'CMD=%s\n' "$cmd_line"
+    return 0
+  fi
+
+  # Guarda 4 de RF-04: binario o /api/tags.
+  if [ "$EXT_TOOLS" = "true" ]; then
+    if ! command -v "$EXT_BIN" >/dev/null 2>&1; then
+      echo "ruta: no está '$EXT_BIN' en el PATH; se instala por usuario con el OK del operador, nunca de sistema" >&2
+      exit 2
+    fi
+  else
+    if ! node -e '
+      fetch(process.argv[1], { signal: AbortSignal.timeout(5000) })
+        .then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1));
+    ' -- "${EXT_URL%/}/api/tags" >/dev/null 2>&1; then
+      echo "ruta: ${EXT_URL%/}/api/tags no responde; Ollama se instala por usuario con el OK del operador" >&2
+      exit 2
+    fi
+  fi
+
+  HEAD0="$(git rev-parse HEAD 2>/dev/null)" || { echo "ruta: no se pudo leer HEAD" >&2; exit 3; }
+  local t0 t1 dur
+  t0="$(node -e 'process.stdout.write(String(Date.now()))')"
+  EXT_TMPDIR="$(mktemp -d)"
+  trap 'rm -f "$EXT_TMPDIR"/* 2>/dev/null; rmdir "$EXT_TMPDIR" 2>/dev/null || true' EXIT
+  # Prompt con `>`: bytes exactos, sin $().
+  node "$SELF_DIR/agentes" prompt --rol implementador --spec "$SPEC_ID" $EXT_PROMPT_FLAGS > "$EXT_TMPDIR/prompt-1.md" \
+    || { echo "ruta: scripts/agentes prompt falló para $SPEC_ID" >&2; exit 3; }
+  EXT_ALLOW=""
+  if [ "$EXT_TOOLS" = "false" ]; then
+    printf '%s' "$RUTA_EXT_SCHEMA" > "$EXT_TMPDIR/schema.json"
+    EXT_ALLOW="$(ruta_ext_allow)"
+  fi
+
+  ruta_ext_vuelta "$EXT_TMPDIR/prompt-1.md"
+  ruta_ext_head
+  vf="$EXT_TMPDIR/verify-1.txt"
+  ruta_ext_verify "$vf"
+
+  local n_agentes=1 segunda=false
+  # RF-08.2: una sola segunda vuelta si quedó algún [FAIL].
+  if grep -q '^\[FAIL\]' "$vf"; then
+    node "$SELF_DIR/agentes" prompt --rol implementador --spec "$SPEC_ID" $EXT_PROMPT_FLAGS --extra "$vf" > "$EXT_TMPDIR/prompt-2.md" \
+      || { echo "ruta: scripts/agentes prompt --extra falló para $SPEC_ID" >&2; exit 3; }
+    ruta_ext_vuelta "$EXT_TMPDIR/prompt-2.md"
+    ruta_ext_head
+    vf="$EXT_TMPDIR/verify-2.txt"
+    ruta_ext_verify "$vf"
+    n_agentes=2
+    segunda=true
+  fi
+
+  # RF-08.1/.3: [MANUAL] por compatibilidad (verify hoy no lo imprime);
+  # [YA-VERDE], [SUPERADO], [AVISO] y VERIFY= no se cuentan.
+  local ca_total ca_pass pasa=true
+  ca_total="$(grep -cE '^\[(PASS|FAIL|MANUAL)\] CA-' "$vf" || true)"
+  ca_pass="$(grep -cE '^\[PASS\] CA-' "$vf" || true)"
+  if grep -q '^\[FAIL\]' "$vf"; then pasa=false; fi
+  ruta_ext_head
+
+  t1="$(node -e 'process.stdout.write(String(Date.now()))')"
+  dur=$(( t1 - t0 ))
+  local run_id notas
+  run_id="ruta-${AGENT}-${SPEC_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+  grep -E '^\[(PASS|FAIL|MANUAL)\] CA-' "$vf" || true
+  printf 'RUTA=%s SPEC=%s WORKFLOW=%s AGENTE=%s MODEL=%s RUN_ID=%s AGENTES=%s TOKENS=0 DURACION_MS=%s PASA=%s CA_PASS=%s/%s SEGUNDA_VUELTA=%s\n' \
+    "$MODE" "$SPEC_ID" "ruta-directo.js" "$AGENT" "$EXT_MODEL" "$run_id" "$n_agentes" "$dur" "$pasa" "$ca_pass" "$ca_total" "$segunda"
+
+  # RF-08.4: el prefijo agente=<a> model=<m> va siempre adelante (lo filtra
+  # RF-09 de 0086); se recorta a 200 caracteres sin partir multibyte.
+  notas="agente=${AGENT} model=${EXT_MODEL}; headless scripts/ruta"
+  [ -z "$NOTAS_ARG" ] || notas="${notas}; ${NOTAS_ARG}"
+  notas="$(printf '%s' "$notas" | node -e 'const s=require("fs").readFileSync(0,"utf8");process.stdout.write(Array.from(s).slice(0,200).join(""))')"
+
+  "$SELF_DIR/rutas" log \
+    --run-id "$run_id" --spec "$SPEC_ID" --workflow ruta-directo.js \
+    --agentes "$n_agentes" --agentes-error 0 \
+    --tokens 0 --duracion-ms "$dur" --tool-uses 0 \
+    --pasa "$pasa" --ca-total "$ca_total" --ca-pass "$ca_pass" --segunda-vuelta "$segunda" \
+    --notas "$notas" --registro "$REGISTRO" \
+    || { echo "ruta: scripts/rutas log falló; la corrida no quedó registrada" >&2; exit 3; }
+  return 0
+}
+
+if [ "$AGENT" != "claude" ]; then
+  correr_agente_externo
+  exit $?
+fi
+
+# --- RF-03: workflow, perfiles (normalizados), args, prompt, comando -------
+
+WORKFLOWS_RAW="$("$SELF_DIR/rutas" "$MODE")" || { echo "ruta: no se pudo resolver workflows para '$MODE'" >&2; exit 2; }
+declare -a WF_PATHS=()
+while IFS= read -r wline; do
+  [ -n "$wline" ] || continue
+  WF_PATHS+=("${wline#WORKFLOW=}")
+done <<< "$WORKFLOWS_RAW"
+
+if [ "$MODE" = "directo" ]; then
+  WORKFLOW_REL="${WF_PATHS[0]}"
+else
+  if [ "$FASE" = "plan" ]; then WORKFLOW_REL="${WF_PATHS[0]}"; else WORKFLOW_REL="${WF_PATHS[1]}"; fi
+fi
+WORKFLOW_ABS="$REPO_ROOT/$WORKFLOW_REL"
+WORKFLOW_BASENAME="$(basename "$WORKFLOW_REL")"
+WORKFLOW_SLUG="${WORKFLOW_BASENAME%.js}"
+
+# Perfiles normalizados al subconjunto {banda, panel, planificador,
+# implementador, verificador, refutador, sintesis} — nunca score/rule ni
+# estimado (que es una mediana sobre el registro: cambiaria el --dry-run
+# con cada corrida nueva, v2 de 0030).
+PERFILES_RAW="$("$SELF_DIR/rutas" perfiles --spec "$SPECFILE")" || { echo "ruta: 'scripts/rutas perfiles' fallo para '$SPEC_ARG'" >&2; exit 2; }
+PERFILES_JSON="$(printf '%s' "$PERFILES_RAW" | node -e '
+  const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
+  const out = { banda: o.banda };
+  if (o.panel !== undefined) out.panel = o.panel;
+  for (const rol of ["planificador", "implementador", "verificador", "refutador", "sintesis"]) out[rol] = o[rol];
+  process.stdout.write(JSON.stringify(out));
+')"
+
+# --plan (solo --fase impl): tolera las tres formas en que puede venir el
+# archivo y pasa siempre el objeto con `grupos` (v2 de 0030).
+PLAN_JSON=""
+if [ "$FASE" = "impl" ]; then
+  [ -f "$PLAN_ARG" ] || { echo "ruta: --plan '$PLAN_ARG' no existe" >&2; exit 2; }
+  if ! PLAN_JSON="$(node -e '
+    const fs = require("fs");
+    let obj;
+    try { obj = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); } catch (e) { process.exit(1); }
+    const hasGrupos = (x) => x && typeof x === "object" && Array.isArray(x.grupos);
+    let plan = null;
+    if (obj && hasGrupos(obj.plan)) plan = obj.plan;
+    else if (obj && obj.result && hasGrupos(obj.result.plan)) plan = obj.result.plan;
+    else if (hasGrupos(obj)) plan = obj;
+    if (!plan) process.exit(1);
+    process.stdout.write(JSON.stringify(plan));
+  ' "$PLAN_ARG")"; then
+    echo "ruta: --plan '$PLAN_ARG' no tiene la forma esperada (falta plan.grupos)" >&2
+    exit 2
+  fi
+fi
+
+ARGS_JSON="$(node -e '
+  const spec = process.argv[1];
+  const perfiles = JSON.parse(process.argv[2]);
+  const planRaw = process.argv[3];
+  const out = { spec, perfiles };
+  if (planRaw) out.plan = JSON.parse(planRaw);
+  process.stdout.write(JSON.stringify(out));
+' "$SPEC_ID" "$PERFILES_JSON" "$PLAN_JSON")"
+
+PROMPT="Ejecutá la herramienta Workflow con scriptPath=${WORKFLOW_ABS} y args=${ARGS_JSON}. No uses ninguna otra herramienta ni modifiques el script. Cuando la herramienta termine, respondé sólo: listo."
+
+CMD_LINE="CMD=CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=${BG_WAIT_MS} printf '%s' \"\$PROMPT\" | ${CLAUDE_BIN} -p --setting-sources ${SETTING_SOURCES} --strict-mcp-config --model ${SESSION_MODEL} --permission-mode ${PERMISSION_MODE} --allowedTools Workflow --disallowedTools \"Bash(git push *)\" --max-turns ${MAX_TURNS} --output-format stream-json --verbose"
+
+# --- RF-01.4: --dry-run — deterministico, sin efectos -----------------------
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  printf 'MODO=%s\n' "$MODE"
+  printf 'SPEC=%s\n' "$SPEC_ID"
+  [ "$MODE" = "exhaustivo" ] && printf 'FASE=%s\n' "$FASE"
+  printf 'WORKFLOW=%s\n' "$WORKFLOW_ABS"
+  printf 'ARGS=%s\n' "$ARGS_JSON"
+  printf 'PROMPT=%s\n' "$PROMPT"
+  printf '%s\n' "$CMD_LINE"
+  exit 0
+fi
+
+# --- RF-03.3/.4: invocacion real, stdout completo a sessions/raw/ ----------
+
+mkdir -p "$REPO_ROOT/sessions/raw"
+TS="$(date -u +%Y%m%dT%H%M%SZ)"
+RAW_REL="sessions/raw/ruta-${SPEC_ID}-${WORKFLOW_SLUG}-${TS}.jsonl"
+RAW_ABS="$REPO_ROOT/$RAW_REL"
+
+# --- RF-02: tope propio (macOS no trae `timeout` de GNU) -------------------
+# El claude -p corre en segundo plano; un vigilante en bash lo mata si pasa
+# headless.timeout_min minutos, para que una ruta colgada de verdad no
+# espere para siempre. Si termina antes, el vigilante no deja nada vivo
+# (el `while kill -0` corta solo y `wait` lo cosecha).
+TIMEOUT_SECS=$(( TIMEOUT_MIN * 60 ))
+
+set +e
+export CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS="$BG_WAIT_MS"
+printf '%s' "$PROMPT" | "$CLAUDE_BIN" -p --setting-sources "$SETTING_SOURCES" --strict-mcp-config \
+  --model "$SESSION_MODEL" --permission-mode "$PERMISSION_MODE" --allowedTools Workflow --disallowedTools "Bash(git push *)" \
+  --max-turns "$MAX_TURNS" --output-format stream-json --verbose > "$RAW_ABS" &
+CLAUDE_PID=$!
+disown "$CLAUDE_PID" 2>/dev/null || true
+
+TIMED_OUT=0
+# Reloj real ($SECONDS de bash), no vueltas de `sleep 1`: si la máquina se
+# suspende o el sistema estira los sleeps, contar vueltas alarga el tope
+# (medido 2026-09-27: un tope de 1 min tardó 3.649 s).
+START_SECS=$SECONDS
+while kill -0 "$CLAUDE_PID" 2>/dev/null; do
+  if [ $(( SECONDS - START_SECS )) -ge "$TIMEOUT_SECS" ]; then
+    TIMED_OUT=1
+    kill "$CLAUDE_PID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      kill -0 "$CLAUDE_PID" 2>/dev/null || break
+      sleep 1
+    done
+    kill -9 "$CLAUDE_PID" 2>/dev/null || true
+    break
+  fi
+  sleep 1
+done
+wait "$CLAUDE_PID" 2>/dev/null
+set -e
+
+if [ "$TIMED_OUT" -eq 1 ]; then
+  echo "ruta: timeout de ${TIMEOUT_MIN} min; el workflow sigue en ${RAW_REL} si llegó a lanzarse" >&2
+  exit 3
+fi
+
+# --- RF-04: lectura del resultado por output_file, no por prosa ------------
+
+NODE_RUN_SRC="$(cat <<'NODEEOF'
+'use strict';
+const fs = require('fs');
+const rawPath = process.argv[1];
+const resultOutPath = process.argv[2];
+
+let text = '';
+try { text = fs.readFileSync(rawPath, 'utf8'); } catch (e) {
+  console.log('FAIL');
+  console.log('ruta: no se pudo leer el crudo del stream (' + rawPath + ')');
+  process.exit(3);
+}
+const lines = text.split('\n');
+
+let toolUseId = null;
+let runId = null;
+const notifications = [];
+let anyIsError = false;
+let denials = [];
+
+for (const raw of lines) {
+  const line = raw.trim();
+  if (!line) continue;
+  let obj;
+  try { obj = JSON.parse(line); } catch (e) { continue; }
+
+  if (!toolUseId && obj.type === 'assistant' && obj.message && Array.isArray(obj.message.content)) {
+    for (const item of obj.message.content) {
+      if (item && item.type === 'tool_use' && item.name === 'Workflow') { toolUseId = item.id; break; }
+    }
+  }
+
+  if (toolUseId && !runId) {
+    let items = null;
+    if (obj.type === 'user' && obj.message && Array.isArray(obj.message.content)) items = obj.message.content;
+    else if (Array.isArray(obj.content)) items = obj.content;
+    if (items) {
+      for (const item of items) {
+        if (item && item.type === 'tool_result' && item.tool_use_id === toolUseId) {
+          let t = '';
+          if (typeof item.content === 'string') t = item.content;
+          else if (Array.isArray(item.content)) {
+            t = item.content.map((c) => (c && typeof c.text === 'string') ? c.text : '').join('\n');
+          }
+          const m = t.match(/Run ID:\s*(wf_[a-z0-9-]+)/);
+          if (m) runId = m[1];
+        }
+      }
+    }
+  }
+
+  if (obj.type === 'system' && obj.subtype === 'task_notification') notifications.push(obj);
+
+  if (obj.is_error === true) anyIsError = true;
+  if (Array.isArray(obj.permission_denials) && obj.permission_denials.length) {
+    denials = denials.concat(obj.permission_denials);
+  }
+}
+
+let notification = null;
+if (toolUseId) {
+  notification = notifications.find((n) => (n.tool_use_id || (n.data && n.data.tool_use_id)) === toolUseId) || null;
+}
+if (!notification && notifications.length === 1) notification = notifications[0];
+
+const denialName = (d) => (typeof d === 'string') ? d : ((d && (d.tool_name || d.tool || d.name)) || JSON.stringify(d));
+
+// RF-05 de specs/0034: resumen agrupado por herramienta y primer segmento de
+// ruta o comando, para que el operador sepa que regla agregar sin abrir el
+// stream crudo. Se calcula una sola vez y se usa tanto si las denegaciones
+// tumban la corrida (FAIL) como si sólo son aviso (D12 de 0030).
+const denialGroupKey = (d) => {
+  const tool = denialName(d);
+  const input = (d && d.tool_input) || {};
+  let seg = '';
+  const path = input.file_path || input.path || null;
+  const cmd = input.command || null;
+  if (path) {
+    const clean = String(path).replace(/^<REPO_ROOT>\/?/, '').replace(/^\/.*?repo-maestro\//, '');
+    const parts = clean.split('/').filter(Boolean);
+    seg = parts.slice(0, 2).join('/');
+  } else if (cmd) {
+    seg = String(cmd).trim().split(/\s+/)[0] || '';
+  }
+  return { tool, seg };
+};
+let denialsSummary = '';
+if (denials.length > 0) {
+  const groups = new Map();
+  for (const d of denials) {
+    const { tool, seg } = denialGroupKey(d);
+    const key = tool + '|' + seg;
+    groups.set(key, (groups.get(key) || 0) + 1);
+  }
+  const parts = [];
+  for (const [key, n] of groups) {
+    const [tool, seg] = key.split('|');
+    parts.push(`${n} ${tool}${seg ? ' en ' + seg : ''}`);
+  }
+  denialsSummary = 'denegaciones: ' + parts.join(', ');
+}
+
+const reasons = [];
+if (!notification) reasons.push('sin task_notification para la herramienta Workflow');
+else if (notification.status !== 'completed') reasons.push(`task_notification con status '${notification.status}' (no completed)`);
+if (anyIsError) reasons.push('is_error en el resultado de la sesion');
+// v4 (D12 de 0030): una denegacion con el workflow completado es AVISO, no
+// fallo — los subagentes siguieron por otro camino y el resultado existe.
+// Sin notificacion completed, las denegaciones si son parte del motivo.
+if (denials.length > 0 && reasons.length > 0) reasons.push('permission_denials no vacio');
+
+if (reasons.length > 0) {
+  console.log('FAIL');
+  console.log('ruta: ' + reasons.join('; '));
+  for (const d of denials) console.log('ruta: denegada la herramienta ' + denialName(d));
+  if (denialsSummary) console.log('ruta: ' + denialsSummary);
+  process.exit(3);
+}
+const warnings = denials.map((d) => 'aviso: denegada la herramienta ' + denialName(d) + ' (el workflow completo igual; ver RAW y .claude/settings.json)');
+
+const usage = notification.usage || {};
+if (!notification.output_file) {
+  console.log('FAIL');
+  console.log('ruta: task_notification sin output_file');
+  process.exit(3);
+}
+let outputFileObj;
+try { outputFileObj = JSON.parse(fs.readFileSync(notification.output_file, 'utf8')); } catch (e) {
+  console.log('FAIL');
+  console.log(`ruta: no se pudo leer output_file '${notification.output_file}'`);
+  process.exit(3);
+}
+let result = outputFileObj.result;
+if (typeof result === 'string') {
+  try { result = JSON.parse(result); } catch (e) { /* se deja como esta si no parsea */ }
+}
+if (!result || typeof result !== 'object') result = {};
+
+fs.writeFileSync(resultOutPath, JSON.stringify(result));
+
+const caArr = Array.isArray(result.ca) ? result.ca : null;
+const agentCount = Number.isFinite(outputFileObj.agentCount) ? outputFileObj.agentCount : 0;
+const totalTokens = Number.isFinite(usage.total_tokens) ? usage.total_tokens : (Number.isFinite(outputFileObj.totalTokens) ? outputFileObj.totalTokens : 0);
+const toolUses = Number.isFinite(usage.tool_uses) ? usage.tool_uses : (Number.isFinite(outputFileObj.totalToolCalls) ? outputFileObj.totalToolCalls : 0);
+const durationMs = Number.isFinite(usage.duration_ms) ? usage.duration_ms : 0;
+const pasa = typeof result.pasa === 'boolean' ? result.pasa : null;
+const caTotal = caArr ? caArr.length : (Number.isInteger(result.ca_total) ? result.ca_total : null);
+const caPass = caArr ? caArr.filter((c) => c && c.estado === 'PASS').length : (Number.isInteger(result.ca_pass) ? result.ca_pass : null);
+const segundaVuelta = typeof result.segunda_vuelta === 'boolean' ? result.segunda_vuelta : null;
+const agentesError = (result.subagent_stats && Number.isInteger(result.subagent_stats.failed)) ? result.subagent_stats.failed : 0;
+
+console.log('OK');
+for (const w of warnings) console.log('WARN=' + w);
+if (denialsSummary) console.log('DENYSUMMARY=' + denialsSummary);
+console.log('RUN_ID=' + (runId || ''));
+console.log('AGENT_COUNT=' + agentCount);
+console.log('TOTAL_TOKENS=' + totalTokens);
+console.log('TOOL_USES=' + toolUses);
+console.log('DURATION_MS=' + durationMs);
+console.log('PASA=' + (pasa === null ? 'null' : pasa));
+console.log('CA_TOTAL=' + (caTotal === null ? 'null' : caTotal));
+console.log('CA_PASS=' + (caPass === null ? 'null' : caPass));
+console.log('SEGUNDA_VUELTA=' + (segundaVuelta === null ? 'null' : segundaVuelta));
+console.log('AGENTES_ERROR=' + agentesError);
+if (caArr) {
+  const clean = (s) => String(s).replace(/\t/g, ' ').replace(/\n/g, ' ');
+  for (const c of caArr) {
+    const id = (c && c.id) || '';
+    const estado = (c && c.estado) || '';
+    const detalle = (c && c.detalle) || '';
+    console.log(['CA', clean(id), clean(estado), clean(detalle)].join('\t'));
+  }
+}
+process.exit(0);
+NODEEOF
+)"
+
+RESULT_TMP="$(mktemp)"
+trap 'rm -f "$RESULT_TMP"' EXIT
+
+set +e
+NODE_OUT="$(node -e "$NODE_RUN_SRC" -- "$RAW_ABS" "$RESULT_TMP")"
+set -e
+
+FIRST_LINE="$(printf '%s\n' "$NODE_OUT" | head -1)"
+if [ "$FIRST_LINE" != "OK" ]; then
+  printf '%s\n' "$NODE_OUT" | tail -n +2
+  exit 3
+fi
+
+F_RUN_ID=""; F_AGENT_COUNT=""; F_TOTAL_TOKENS=""; F_TOOL_USES=""; F_DURATION_MS=""
+F_PASA=""; F_CA_TOTAL=""; F_CA_PASS=""; F_SEGUNDA_VUELTA=""; F_AGENTES_ERROR=""
+declare -a CA_LINES=()
+
+while IFS= read -r line; do
+  case "$line" in
+    OK) : ;;
+    WARN=*) echo "ruta: ${line#WARN=}" >&2 ;;
+    DENYSUMMARY=*) echo "ruta: ${line#DENYSUMMARY=}" >&2 ;;
+    RUN_ID=*) F_RUN_ID="${line#RUN_ID=}" ;;
+    AGENT_COUNT=*) F_AGENT_COUNT="${line#AGENT_COUNT=}" ;;
+    TOTAL_TOKENS=*) F_TOTAL_TOKENS="${line#TOTAL_TOKENS=}" ;;
+    TOOL_USES=*) F_TOOL_USES="${line#TOOL_USES=}" ;;
+    DURATION_MS=*) F_DURATION_MS="${line#DURATION_MS=}" ;;
+    PASA=*) F_PASA="${line#PASA=}" ;;
+    CA_TOTAL=*) F_CA_TOTAL="${line#CA_TOTAL=}" ;;
+    CA_PASS=*) F_CA_PASS="${line#CA_PASS=}" ;;
+    SEGUNDA_VUELTA=*) F_SEGUNDA_VUELTA="${line#SEGUNDA_VUELTA=}" ;;
+    AGENTES_ERROR=*) F_AGENTES_ERROR="${line#AGENTES_ERROR=}" ;;
+    CA$'\t'*) CA_LINES+=("$line") ;;
+  esac
+done <<< "$NODE_OUT"
+
+# --- RF-05: --fase plan guarda el plan como archivo -------------------------
+
+PLAN_JSON_PATH=""
+PLAN_MD_PATH=""
+if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "plan" ]; then
+  mkdir -p "$REPO_ROOT/sessions/planes"
+  PLAN_JSON_PATH="sessions/planes/${SPEC_ID}-${F_RUN_ID}.json"
+  PLAN_MD_PATH="sessions/planes/${SPEC_ID}-${F_RUN_ID}.md"
+
+  # RNF-05: sin rutas absolutas del home versionadas — se reemplaza ANTES de
+  # escribir ambos archivos.
+  RESULT_RAW="$(cat "$RESULT_TMP")"
+  # RNF-05: el patron se arma partido para que este propio archivo, que es
+  # trackeado, no dispare doctor RF-18.5 (mismo truco que scripts/doctor).
+  HOME_PAT="/Us""ers/"
+  SCRUBBED_RESULT="$(printf '%s' "$RESULT_RAW" | sed "s#${HOME_PAT}#<REPO_ROOT>/#g")"
+  printf '%s\n' "$SCRUBBED_RESULT" > "$REPO_ROOT/$PLAN_JSON_PATH"
+
+  # RF-09 de spec 0051 (not in this snapshot):
+  # plan.diagrama es JSON IR `sequence` de archify (string); se renderiza a
+  # un HTML local con `diagrama --json` y el plan guarda sólo la ruta.
+  DIAGRAMA_IR="$(printf '%s' "$SCRUBBED_RESULT" | node -e '
+    const o = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    const y = (o.plan && typeof o.plan.diagrama === "string") ? o.plan.diagrama
+      : (typeof o.diagrama === "string" ? o.diagrama : "");
+    process.stdout.write(y);
+  ')"
+
+  DIAGRAMA_BLOCK=""
+  if [ -n "$DIAGRAMA_IR" ]; then
+    DIAG_TMP="$(mktemp)"
+    DIAG_ERR="$(mktemp)"
+    printf '%s\n' "$DIAGRAMA_IR" > "$DIAG_TMP"
+    if DIAG_OUT="$("$SELF_DIR/diagrama" --json "$DIAG_TMP" 2>"$DIAG_ERR")"; then
+      rel="${DIAG_OUT##*HTML=}"
+      rel="${rel#"$REPO_ROOT"/}"
+      rel="$(printf '%s' "$rel" | sed "s#${HOME_PAT}#<REPO_ROOT>/#g")"
+      DIAGRAMA_BLOCK="Diagrama: $rel"
+    else
+      DIAG_MSG="$DIAG_OUT"
+      if [ -s "$DIAG_ERR" ]; then
+        DIAG_MSG="${DIAG_MSG:+$DIAG_MSG$'\n'}$(cat "$DIAG_ERR")"
+      fi
+      DIAG_MSG="$(printf '%s' "$DIAG_MSG" | sed "s#${HOME_PAT}#<REPO_ROOT>/#g")"
+      DIAGRAMA_BLOCK="**error al renderizar el diagrama:**"$'\n\n'"$DIAG_MSG"
+    fi
+    rm -f "$DIAG_TMP" "$DIAG_ERR"
+  else
+    DIAGRAMA_BLOCK="(el plan no trae diagrama)"
+  fi
+
+  node -e '
+    const fs = require("fs");
+    const o = JSON.parse(process.argv[1]);
+    const spec = process.argv[2], runId = process.argv[3], diagBlock = process.argv[4], outPath = process.argv[5];
+    const plan = (o.plan && Array.isArray(o.plan.grupos)) ? o.plan : (Array.isArray(o.grupos) ? o : {});
+    const lines = [];
+    lines.push("# Plan — " + spec + " (" + runId + ")", "");
+    lines.push("## Enfoque", "", plan.enfoque || "(sin enfoque)", "");
+    lines.push("## Grupos", "");
+    for (const g of (plan.grupos || [])) {
+      lines.push("- **" + (g.nombre || "") + "**: " + (g.descripcion || ""));
+      lines.push("  - archivos: " + (g.archivos || []).join(", "));
+      lines.push("  - ca_cubiertas: " + (g.ca_cubiertas || []).join(", "));
+      lines.push("  - comparte_archivos: " + (g.comparte_archivos === true));
+    }
+    lines.push("");
+    lines.push("## Casos borde", "");
+    for (const c of (plan.casos_borde || [])) lines.push("- " + c);
+    lines.push("");
+    lines.push("## Supuestos", "");
+    for (const s of (plan.supuestos || [])) lines.push("- " + s);
+    lines.push("");
+    lines.push("## Diagrama", "", diagBlock, "");
+    fs.writeFileSync(outPath, lines.join("\n"));
+  ' "$SCRUBBED_RESULT" "$SPEC_ID" "$F_RUN_ID" "$DIAGRAMA_BLOCK" "$REPO_ROOT/$PLAN_MD_PATH"
+fi
+
+# --- RF-04.4: salida — CA lines primero, formato de scripts/verify ---------
+
+for line in "${CA_LINES[@]:-}"; do
+  [ -n "$line" ] || continue
+  IFS=$'\t' read -r _tag ca_id ca_estado ca_detalle <<< "$line"
+  case "$ca_estado" in
+    PASS) print_pass "$ca_id" ;;
+    FAIL) if [ -n "$ca_detalle" ]; then print_fail "$ca_id $ca_detalle"; else print_fail "$ca_id"; fi ;;
+    MANUAL) if [ -n "$ca_detalle" ]; then print_manual "$ca_id $ca_detalle"; else print_manual "$ca_id"; fi ;;
+    *) print_fail "$ca_id (estado desconocido: $ca_estado)" ;;
+  esac
+done
+
+if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "plan" ]; then
+  printf 'RUTA=%s SPEC=%s WORKFLOW=%s RUN_ID=%s AGENTES=%s TOKENS=%s DURACION_MS=%s PASA=n/a PLAN=%s RAW=%s\n' \
+    "$MODE" "$SPEC_ID" "$WORKFLOW_BASENAME" "$F_RUN_ID" "$F_AGENT_COUNT" "$F_TOTAL_TOKENS" "$F_DURATION_MS" "$PLAN_JSON_PATH" "$RAW_REL"
+  printf '%s\n' "$PLAN_JSON_PATH"
+  printf '%s\n' "$PLAN_MD_PATH"
+  printf 'siguiente: scripts/ruta exhaustivo %s --fase impl --plan %s\n' "$SPEC_ID" "$PLAN_JSON_PATH"
+else
+  printf 'RUTA=%s SPEC=%s WORKFLOW=%s RUN_ID=%s AGENTES=%s TOKENS=%s DURACION_MS=%s PASA=%s CA_PASS=%s/%s SEGUNDA_VUELTA=%s RAW=%s\n' \
+    "$MODE" "$SPEC_ID" "$WORKFLOW_BASENAME" "$F_RUN_ID" "$F_AGENT_COUNT" "$F_TOTAL_TOKENS" "$F_DURATION_MS" "$F_PASA" "$F_CA_PASS" "$F_CA_TOTAL" "$F_SEGUNDA_VUELTA" "$RAW_REL"
+fi
+
+# --- RF-06: registro automatico ---------------------------------------------
+
+NOTAS_BASE="headless scripts/ruta"
+FULL_NOTAS="$NOTAS_BASE"
+[ -z "$NOTAS_ARG" ] || FULL_NOTAS="${NOTAS_BASE}; ${NOTAS_ARG}"
+FULL_NOTAS="$(printf '%s' "$FULL_NOTAS" | node -e 'const s=require("fs").readFileSync(0,"utf8");process.stdout.write(Array.from(s).slice(0,200).join(""))')"
+
+if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "plan" ]; then
+  "$SELF_DIR/rutas" log \
+    --run-id "$F_RUN_ID" --spec "$SPEC_ID" --workflow "$WORKFLOW_BASENAME" \
+    --agentes "$F_AGENT_COUNT" --agentes-error "$F_AGENTES_ERROR" \
+    --tokens "$F_TOTAL_TOKENS" --duracion-ms "$F_DURATION_MS" --tool-uses "$F_TOOL_USES" \
+    --pasa true \
+    --perfiles "$PERFILES_JSON" --notas "$FULL_NOTAS" --registro "$REGISTRO"
+else
+  "$SELF_DIR/rutas" log \
+    --run-id "$F_RUN_ID" --spec "$SPEC_ID" --workflow "$WORKFLOW_BASENAME" \
+    --agentes "$F_AGENT_COUNT" --agentes-error "$F_AGENTES_ERROR" \
+    --tokens "$F_TOTAL_TOKENS" --duracion-ms "$F_DURATION_MS" --tool-uses "$F_TOOL_USES" \
+    --pasa "$F_PASA" --ca-total "$F_CA_TOTAL" --ca-pass "$F_CA_PASS" --segunda-vuelta "$F_SEGUNDA_VUELTA" \
+    --perfiles "$PERFILES_JSON" --notas "$FULL_NOTAS" --registro "$REGISTRO"
+fi

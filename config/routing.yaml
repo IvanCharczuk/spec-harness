@@ -1,0 +1,27 @@
+# Pesos, umbrales y hard_exclusions del scorer — RF-01/RF-04 de spec 0002 (not in this snapshot)
+# (implementa RF-05/RF-06/RF-07/RF-24 de specs/0001-repo-maestro.md).
+# Nunca hardcodeado en scripts/route ni scripts/lib/routing.sh (RNF-04 de 0002).
+
+weights:
+  S1: 3   # por RF numerado en §3
+  S2: 2   # por path único en §5
+  S3: 2   # por CA en §6
+  S4: 4   # por bloqueo único, o marca [SIN CONFIRMAR] fuera de un bloqueo, en §7-§8
+  S5: 1   # por cada 100 LOC de loc_estimate (redondeo hacia arriba)
+
+threshold_simple: 60   # score <= esto -> TIER_A
+threshold_complex: 91  # score >= esto -> TIER_B
+
+# Mismos cortes que las bandas de perfiles (spec 0023 (not in this snapshot)...md):
+# éste es el único lugar del repo donde viven los umbrales (0027 RF-02/RF-03);
+# `config/rutas.yaml` ya no tiene una escalera propia. Se recalibran sólo
+# citando la salida de `scripts/rutas costo` (0027 RF-04) y sólo tras acumular
+# al menos tres corridas reales por banda (0027 D2) — nunca a mano ni por
+# `scripts/route --stats`, que sigue leyendo `sessions/index.jsonl` vacío
+# desde 0014 (0002 RF-04, camino legado).
+
+hard_exclusions: []    # substrings (case-insensitive) sobre front-matter.title
+                        # y sobre el texto crudo de §2 (Alcance). Vacío = sin
+                        # bloqueo (B-01 de 0001).
+
+max_manual_ratio: 0.3  # [SUPUESTO] — ver spec 0005 (not in this snapshot) §7 D6

@@ -1,0 +1,60 @@
+# CLAUDE.md — Tier A (personal)
+
+Contrato específico de este tier. El contrato común a ambos tiers está en
+`AGENTS.md` — leelo primero si no lo hiciste ya.
+
+**Spec activa:** `specs/${SESSION_SPEC_ID}-*.md`, tier `${SESSION_TIER}`
+(ambas variables las exporta `scripts/session`, RF-04 de
+`spec 0004 (not in this snapshot)` — no hace falta que te las diga el operador).
+
+## Profundidad de planificación
+
+Este tier sólo recibe specs que el scorer ya clasificó como simples
+(`score <= 20` de `config/routing.yaml` — pocos RF, pocos paths, pocos
+bloqueos, LOC bajo). Un plan corto (lista de pasos, sin rondas de
+plan-mode) alcanza antes de escribir código, salvo que algo puntual de
+la spec sea genuinamente ambiguo. Si durante el trabajo encontrás que la
+tarea es más compleja de lo que el score sugería, **esa es la señal de
+escalar** (ver abajo) — no un motivo para planificar más acá.
+
+## Aprobación de comandos destructivos
+
+Nunca auto mode ni bypass de permisos sin supervisión real — ninguna
+acción irreversible (`git push`, `rm`, `git reset --hard`, edición de
+credenciales o hooks) se ejecuta sin confirmación explícita del operador
+en el momento, sea cual sea el tier. En este tier podés encadenar
+operaciones de lectura/reversibles (tests, lectura de archivos, `git
+status`/`diff`) sin pedir confirmación en cada una — pausá sólo antes de
+lo irreversible.
+
+## Verbosidad del log
+
+Conciso: al terminar, un resumen de qué cambió y por qué, sin narrar cada
+paso intermedio. Si algo salió distinto de lo esperado, decilo — pero no
+hace falta el detalle completo de cada comando que no aportó nada nuevo.
+
+## Al declarar escalado
+
+Señales de escalar — dos categorías distintas:
+
+1. **Disparadores duros de RF-05 de `spec 0002 (not in this snapshot)`** (mecánicos,
+   verificables por `route` sin ambigüedad): `schema_change: true`,
+   `arch_decision: true`, o un `target_branch` que no empiece con
+   `personal/`, `spec/` ni `sandbox/`. Si durante el trabajo notás que
+   cualquiera de estos tres aplica y no estaba marcado al arrancar, es
+   señal automática de detenerse y declarar.
+2. **Bloqueo externo real, descubierto en el momento** (no es uno de
+   los tres disparadores de RF-05 — es criterio del agente, no un
+   mecanismo automático de scoring): si encontrás una dependencia
+   externa genuina que la spec no contemplaba (una API que no existe,
+   un permiso que falta, algo fuera de tu control), también es motivo
+   de parar y declarar — aunque `route` nunca lo detecte por sí solo.
+
+Antes de parar (RF-16 madre, `AGENTS.md`): dejá la spec en el estado
+exacto que `scripts/escalate` va a exigir (RF-02/RF-03 de
+`spec 0008 (not in this snapshot)`) — bumpeá `version` en el front-matter
+(estrictamente mayor a la que tenía cuando arrancó esta sesión) y agregá
+una entrada en `§Historial` que matchee el patrón literal `— v<versión
+actual> —`, con los requerimientos descubiertos incorporados a la spec
+(§6 actualizado). Sin esos dos, `scripts/escalate` va a rechazar el
+escalado aunque el operador ya haya decidido escalar.

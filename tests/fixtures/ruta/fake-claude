@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# tests/fixtures/ruta/fake-claude — RF-08 de
+# spec 0030 (not in this snapshot)
+#
+# Reemplaza al binario `claude` real en los CA de scripts/ruta: no llama a
+# ningun modelo. Valida que el comando reciba los flags obligatorios
+# (--output-format stream-json, --allowedTools Workflow, --model <id>) y, si
+# los tres estan, emite el stream-json enlatado del caso pedido por
+# FAKE_CLAUDE_CASE (ok-directo|ok-plan|denegado|denegado-varias|
+# sin-notificacion). Ignora stdin: el prompt real no le importa a un
+# fixture. `colgado` (RF-02 de spec 0034 (not in this snapshot)
+# editan-claude.md) no emite nada: se reemplaza por un `sleep` con argv0
+# renombrado para que `pgrep -f 'fake-claude.*colgado'` lo encuentre, y
+# corta recien cuando `scripts/ruta` lo mata por timeout.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [ ! -t 0 ]; then
+  cat >/dev/null || true
+fi
+
+has_output_format_stream_json=0
+has_allowed_tools_workflow=0
+has_model=0
+args=("$@")
+n=${#args[@]}
+i=0
+while [ "$i" -lt "$n" ]; do
+  arg="${args[$i]}"
+  next="${args[$((i + 1))]:-}"
+  case "$arg" in
+    --output-format)
+      [ "$next" = "stream-json" ] && has_output_format_stream_json=1
+      ;;
+    --allowedTools)
+      [ "$next" = "Workflow" ] && has_allowed_tools_workflow=1
+      ;;
+    --model)
+      [ -n "$next" ] && has_model=1
+      ;;
+  esac
+  i=$((i + 1))
+done
+
+if [ "$has_output_format_stream_json" -ne 1 ] || [ "$has_allowed_tools_workflow" -ne 1 ] || [ "$has_model" -ne 1 ]; then
+  echo "fake-claude: faltan flags obligatorios (--output-format stream-json --allowedTools Workflow --model <id>)" >&2
+  exit 9
+fi
+
+case="${FAKE_CLAUDE_CASE:-}"
+case "$case" in
+  ok-directo|ok-plan|denegado|denegado-varias|sin-notificacion) ;;
+  colgado)
+    # Nunca escribe stream-json: se queda "colgado" hasta que lo maten.
+    exec -a "fake-claude-colgado" sleep 999999
+    ;;
+  *)
+    echo "fake-claude: FAKE_CLAUDE_CASE invalido o ausente: '$case'" >&2
+    exit 9
+    ;;
+esac
+
+jsonl="$SELF_DIR/$case.jsonl"
+output_json="$SELF_DIR/$case.output.json"
+
+if [ ! -f "$jsonl" ]; then
+  echo "fake-claude: no existe $jsonl" >&2
+  exit 9
+fi
+
+if [ -f "$output_json" ]; then
+  tmp_output="$(mktemp)"
+  cp "$output_json" "$tmp_output"
+  sed "s#@OUTPUT@#$tmp_output#g" "$jsonl"
+else
+  cat "$jsonl"
+fi

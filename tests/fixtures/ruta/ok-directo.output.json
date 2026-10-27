@@ -1,0 +1,23 @@
+{
+  "result": {
+    "spec": "0028",
+    "ca": [
+      { "id": "CA-01", "estado": "PASS" },
+      { "id": "CA-02", "estado": "PASS" },
+      { "id": "CA-03", "estado": "PASS" },
+      { "id": "CA-04", "estado": "PASS" },
+      { "id": "CA-05", "estado": "PASS" },
+      { "id": "CA-06", "estado": "PASS" },
+      { "id": "CA-07", "estado": "MANUAL" }
+    ],
+    "lint_ok": true,
+    "doctor_ok": true,
+    "pasa": true,
+    "ca_total": 7,
+    "ca_pass": 6,
+    "segunda_vuelta": false
+  },
+  "agentCount": 2,
+  "totalTokens": 116757,
+  "totalToolCalls": 73
+}

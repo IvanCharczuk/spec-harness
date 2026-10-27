@@ -1,0 +1,66 @@
+# Mapeo modo de trabajo -> workflows guardados (RF-04 de specs/0021).
+# Lo lee scripts/rutas; nunca hardcodeado en el script. Cada entrada es una
+# ruta relativa a la raiz del repo; el orden de la lista es el orden en que
+# el agente de la sesion corre los workflows con la herramienta Workflow.
+# Entre los dos de `exhaustivo` va la aprobacion del plan por el operador
+# (RF-03 / D2 de 0021).
+
+directo:
+  - .claude/workflows/ruta-directo.js
+
+exhaustivo:
+  - .claude/workflows/ruta-exhaustivo-plan.js
+  - .claude/workflows/ruta-exhaustivo-impl.js
+
+rutinas:
+  - .claude/workflows/rutina-salud-repo.js
+
+# Perfiles de agente por banda (RF-01 de specs/0023). La banda sale de
+# TIER/RULE de scripts/route (0027 RF-03): los cortes son
+# threshold_simple/threshold_complex de config/routing.yaml, la única fuente
+# de la escalera (0027). `scripts/rutas perfiles` y `--lint` leen esta
+# sección; nada de esto se hardcodea en scripts/rutas (RNF-03 de 0023).
+# `fable` e `inherit` no figuran en modelos_validos: ningún subagente hereda
+# el modelo de la sesión (RNF-06).
+perfiles:
+  modelos_validos: [haiku, sonnet, opus]
+  esfuerzos_validos: [low, medium, high, xhigh, max]
+  bandas:
+    directo:
+      panel:         { planificadores: 1, refutadores_por_plan: 1 }
+      planificador:  { model: sonnet, effort: medium }
+      implementador: { model: sonnet, effort: medium }
+      verificador:   { model: haiku,  effort: low }
+      refutador:     { model: haiku,  effort: low }
+      sintesis:      { model: opus,    effort: medium }
+    exhaustivo:
+      panel:         { planificadores: 2, refutadores_por_plan: 2 }
+      planificador:  { model: sonnet, effort: high }
+      implementador: { model: sonnet, effort: high }
+      verificador:   { model: haiku,  effort: low }
+      refutador:     { model: haiku,  effort: medium }
+      sintesis:      { model: opus,    effort: high }
+    exhaustivo-critico:  # RULE=hard-* (disparador duro) o RULE=score-complex
+      panel:         { planificadores: 3, refutadores_por_plan: 3 }
+      planificador:  { model: opus,    effort: high }
+      implementador: { model: opus,    effort: high }
+      verificador:   { model: sonnet, effort: low }
+      refutador:     { model: sonnet, effort: medium }
+      sintesis:      { model: opus,    effort: xhigh }
+
+# Sesion headless de scripts/ruta (RF-02 de
+# spec 0030 (not in this snapshot)).
+# `scripts/ruta` lee estas claves con awk, sin defaults escondidos en
+# el script: si falta una, exit 2 nombrandola. `permission_mode` solo admite
+# acceptEdits o default (RNF-04: nunca bypassPermissions); `session_model`
+# va por ID completo, nunca alias (D2 de 0030 — `--model haiku` en `-p`
+# resolvio a sonnet, medido 2026-09-21). `bg_wait_ms` y `timeout_min` son de
+# RF-01/RF-02 de spec 0034 (not in this snapshot):
+# rutas de mas de 10 minutos, sin el corte a los 600s del harness.
+headless:
+  session_model: claude-haiku-4-5-20251001   # ID completo, nunca alias (D2)
+  permission_mode: acceptEdits               # nunca bypassPermissions (RNF-04)
+  max_turns: 6
+  setting_sources: project                   # solo .claude/settings.json del repo
+  bg_wait_ms: -1
+  timeout_min: 0

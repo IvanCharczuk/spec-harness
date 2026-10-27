@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","session_id":"fake-0002"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_fake002","name":"Workflow","input":{"scriptPath":"<REPO_ROOT>/.claude/workflows/ruta-exhaustivo-plan.js","args":{}}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_fake002","content":[{"type":"text","text":"Workflow iniciado. Run ID: wf_fake0002-bbb"}]}]}}
+{"type":"system","subtype":"task_notification","tool_use_id":"toolu_fake002","status":"completed","output_file":"@OUTPUT@","usage":{"total_tokens":245613,"tool_uses":61,"duration_ms":612340}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"listo"}]}}
+{"type":"result","subtype":"success","is_error":false,"permission_denials":[],"total_cost_usd":0.041}

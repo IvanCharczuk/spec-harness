@@ -1,0 +1,9 @@
+capas:
+  - { id: origen, nombre: Origen }
+  - { id: destino, nombre: Destino }
+participantes:
+  - { id: O, nombre: "origen-svc", capa: origen, hace: "Arranca el paso del plan", vive_en: ["ejemplo/plan-origen.sh"] }
+  - { id: D, nombre: "destino-svc", capa: destino, hace: "Ejecuta el paso del plan", vive_en: ["ejemplo/plan-destino.sh"] }
+secuencia:
+  - { de: O, a: D, msg: "ejecutar paso", tipo: peticion, activa: true }
+  - { de: D, a: O, msg: "listo", tipo: respuesta }

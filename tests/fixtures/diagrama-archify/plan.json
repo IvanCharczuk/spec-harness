@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "diagram_type": "sequence",
+  "meta": { "title": "Plan de ruta" },
+  "participants": [
+    { "id": "pl", "type": "backend", "label": "planificador" },
+    { "id": "im", "type": "backend", "label": "implementador" },
+    { "id": "ve", "type": "security", "label": "verificador" }
+  ],
+  "messages": [
+    { "from": "pl", "to": "im", "label": "grupo G1", "variant": "emphasis" },
+    { "from": "im", "to": "ve", "label": "archivos" },
+    { "from": "ve", "to": "pl", "label": "PASS", "variant": "return" }
+  ]
+}

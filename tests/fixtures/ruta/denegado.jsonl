@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"fake-0003"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_fake003","name":"Workflow","input":{"scriptPath":"<REPO_ROOT>/.claude/workflows/ruta-directo.js","args":{}}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_fake003","content":[{"type":"text","text":"Workflow iniciado. Run ID: wf_fake0003-ccc"}]}]}}
+{"type":"result","subtype":"error","is_error":true,"permission_denials":[{"tool_name":"Edit","tool_input":{"file_path":"<REPO_ROOT>/scripts/ruta"}}]}

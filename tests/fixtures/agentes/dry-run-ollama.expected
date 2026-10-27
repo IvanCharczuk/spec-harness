@@ -1,0 +1,6 @@
+MODO=directo
+SPEC=0028
+AGENTE=ollama
+MODEL=qwen2.5-coder:7b
+PROMPT_SHA=af33763cf9532d92ee3eb14a033a8035a519ceda3236bac144dc688c32abf748
+CMD=scripts/agentes pedir --agente ollama --model qwen2.5-coder:7b --url http://localhost:11434 --prompt-file <PROMPT_FILE> --schema <SCHEMA_FILE>

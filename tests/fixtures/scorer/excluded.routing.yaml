@@ -1,0 +1,13 @@
+# Fixture de config/routing.yaml para CA-08: hard_exclusions poblado.
+weights:
+  S1: 3
+  S2: 2
+  S3: 2
+  S4: 4
+  S5: 1
+
+threshold_simple: 20
+threshold_complex: 40
+
+hard_exclusions:
+  - "SECRETO-CORP"

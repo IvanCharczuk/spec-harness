@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Mock de editor para spec 0012 (not in this snapshot): no hace nada, exit 0
+# inmediato. Usado por las CA que sólo necesitan que el paso de edición
+# "termine" sin tocar el contenido del archivo (CA-03, CA-04, CA-07).
+exit 0

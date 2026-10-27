@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# RF-09 de specs/0001-repo-maestro.md. Implementado por spec 0005 (not in this snapshot).
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/spec.sh
+source "$SELF_DIR/lib/spec.sh"
+# shellcheck source=lib/verify.sh
+source "$SELF_DIR/lib/verify.sh"
+cd "$REPO_ROOT"
+
+usage() {
+  echo "uso: scripts/verify <id|ruta> [--routing-config <path>] [--ca CA-NN ...]" >&2
+}
+
+ARG="${1:-}"
+[ -n "$ARG" ] || { usage; exit 2; }
+shift || true
+
+ROUTING_CONFIG="$REPO_ROOT/config/routing.yaml"
+CA_FILTER=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --routing-config) ROUTING_CONFIG="${2:-}"; shift 2 ;;
+    --ca) CA_FILTER+=("${2:-}"); shift 2 ;;
+    *) echo "verify: argumento desconocido: $1" >&2; exit 2 ;;
+  esac
+done
+
+if ! FILE="$(resolve_spec "$ARG")" || [ ! -f "$FILE" ]; then
+  echo "verify: no se pudo resolver '$ARG'" >&2
+  exit 2
+fi
+
+ID="$(basename "$FILE" | grep -oE '^[0-9]{4}' || true)"
+[ -n "$ID" ] || ID="$(basename "$FILE" .md)"
+
+MAX_RATIO="$(yaml_field "$ROUTING_CONFIG" max_manual_ratio || true)"
+[ -n "$MAX_RATIO" ] || MAX_RATIO=0
+
+# --ca CA-NN (repetible, RF-01 de specs/0036): se evalúa sólo el subconjunto
+# pedido, en el orden de aparición de §6, y no se mide max_manual_ratio
+# (sobre un subconjunto no mide nada).
+SELECTED_CAS=()
+if [ "${#CA_FILTER[@]}" -gt 0 ]; then
+  all_cas="$(ca_ids "$FILE")"
+  for want in "${CA_FILTER[@]}"; do
+    if ! printf '%s\n' "$all_cas" | grep -qxF "$want"; then
+      echo "verify: $want no existe en §6 de $ID" >&2
+      exit 2
+    fi
+  done
+  while IFS= read -r ca; do
+    [ -z "$ca" ] && continue
+    for want in "${CA_FILTER[@]}"; do
+      if [ "$ca" = "$want" ]; then
+        SELECTED_CAS+=("$ca")
+        break
+      fi
+    done
+  done <<< "$all_cas"
+else
+  while IFS= read -r ca; do
+    [ -z "$ca" ] && continue
+    SELECTED_CAS+=("$ca")
+  done < <(ca_ids "$FILE")
+fi
+
+# RF-01 de specs/0046: id de la spec que se está verificando tal como
+# aparece en su propio front-matter (no el que se dedujo del nombre de
+# archivo), porque config/ca-superados.yaml matchea contra ese campo — así
+# sirve también para una spec de fixture como tests/fixtures/verify/spec-superados.md.
+FM_ID="$(fm_field "$FILE" id)"
+[ -n "$FM_ID" ] || FM_ID="$ID"
+
+total=0
+pass=0
+fail=0
+manual_count=0
+superado_count=0
+ya_verde_count=0
+
+# RF-03 de specs/0070: registro de la corrida en rojo (sólo lectura). Sin
+# registro, la salida queda byte a byte igual a la de antes.
+ROJO_REL="sessions/rojo/$FM_ID.txt"
+ROJO_FILE="$REPO_ROOT/$ROJO_REL"
+
+for ca in "${SELECTED_CAS[@]}"; do
+  # RF-02 de specs/0046: un CA con entrada válida en el registro no corre
+  # su check: y no cuenta como PASS ni FAIL (tampoco suma a CA_TOTAL ni a
+  # manual_count — ver el comentario de decisión en lib/verify.sh).
+  sup="$(ca_superado_check "$FILE" "$FM_ID" "$ca")"
+  sup_kind="$(printf '%s' "$sup" | cut -f1)"
+  if [ "$sup_kind" = "SUPERADO" ]; then
+    sup_por="$(printf '%s' "$sup" | cut -f2)"
+    sup_motivo="$(printf '%s' "$sup" | cut -f3-)"
+    superado_count=$((superado_count + 1))
+    printf '[SUPERADO] %s por %s: %s\n' "$ca" "$sup_por" "$sup_motivo"
+    continue
+  fi
+  if [ "$sup_kind" = "INVALIDO" ]; then
+    sup_reason="$(printf '%s' "$sup" | cut -f2-)"
+    printf '[AVISO] ca-superados: %s\n' "$sup_reason"
+  fi
+
+  total=$((total + 1))
+  result="$(evaluate_ca "$FILE" "$ca")"
+  status="$(printf '%s' "$result" | cut -f1)"
+  category="$(printf '%s' "$result" | cut -f2)"
+  detail="$(printf '%s' "$result" | cut -f3)"
+  [ "$category" = "manual" ] && manual_count=$((manual_count + 1))
+  if [ "$status" = "PASS" ]; then
+    pass=$((pass + 1))
+    printf '[PASS] %s\n' "$ca"
+    if [ -f "$ROJO_FILE" ] && grep -qxF "[PASS] $ca" "$ROJO_FILE" \
+        && ! ca_compat "$(ca_block "$FILE" "$ca")"; then
+      ya_verde_count=$((ya_verde_count + 1))
+      printf '[YA-VERDE] %s pasaba antes de implementar (%s)\n' "$ca" "$ROJO_REL"
+    fi
+  else
+    fail=$((fail + 1))
+    # RF-03 de specs/0046: exit 127 = comando no encontrado, pista aparte.
+    hint=""
+    if printf '%s' "$detail" | grep -qE '^exit=127( |$)'; then
+      hint=" (comando no encontrado: ¿falta una herramienta en esta máquina?)"
+    fi
+    if [ -n "$detail" ]; then
+      printf '[FAIL] %s %s%s\n' "$ca" "$detail" "$hint"
+    else
+      printf '[FAIL] %s%s\n' "$ca" "$hint"
+    fi
+  fi
+done
+
+if [ "${#CA_FILTER[@]}" -gt 0 ]; then
+  ratio_pct=0
+  max_pct=0
+  exceeded=0
+else
+  read -r max_pct exceeded < <(awk -v m="$manual_count" -v t="$total" -v mx="$MAX_RATIO" '
+    BEGIN {
+      maxpct = int(mx * 100 + 0.5)
+      exc = (t > 0 && (m / t) > mx) ? 1 : 0
+      printf "%d %d\n", maxpct, exc
+    }
+  ')
+  ratio_pct="$(pct_ratio "$manual_count" "$total")"
+
+  if [ "$exceeded" -eq 1 ]; then
+    printf '[FAIL] ratio de CA manuales %s%% supera max_manual_ratio %s%%\n' "$ratio_pct" "$max_pct"
+  fi
+fi
+
+printf 'VERIFY=%s CA_TOTAL=%s CA_PASS=%s CA_FAIL=%s MANUAL_RATIO=%s%% MAX_MANUAL_RATIO=%s%%' \
+  "$ID" "$total" "$pass" "$fail" "$ratio_pct" "$max_pct"
+# RF-02 de specs/0046: sólo si hay superados se agrega este campo; sin
+# superados la línea queda byte a byte igual a la de antes (RNF-01).
+[ "$superado_count" -gt 0 ] && printf ' CA_SUPERADOS=%s' "$superado_count"
+# RF-05 de specs/0070: sólo si hubo [YA-VERDE].
+[ "$ya_verde_count" -gt 0 ] && printf ' CA_YA_VERDES=%s' "$ya_verde_count"
+printf '\n'
+
+if [ "$fail" -eq 0 ] && [ "$exceeded" -eq 0 ]; then
+  exit 0
+else
+  exit 1
+fi

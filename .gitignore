@@ -1,0 +1,9 @@
+.state/
+*.credentials.yaml
+.env
+.env.*
+!.env.enc
+sessions/raw/
+.DS_Store
+node_modules
+.claude/settings.local.json

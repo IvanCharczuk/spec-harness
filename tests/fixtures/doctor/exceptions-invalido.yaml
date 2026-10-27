@@ -1,0 +1,6 @@
+# hash de 40 hex que no corresponde a ningún commit de este repo (fixture,
+# no referencia historia real — RNF/8.3 de 0028).
+rf_18_10:
+  - commit: 0000000000000000000000000000000000000000
+    fecha: 2026-09-17
+    motivo: "fixture: hash inexistente para CA-03"

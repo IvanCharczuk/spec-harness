@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# RF-22 de specs/0001-repo-maestro.md.
+# Implementado por spec 0007 (not in this snapshot).
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+cd "$REPO_ROOT"
+
+usage() {
+  cat >&2 <<'EOF'
+uso:
+  scripts/kill <personal|work|all> [--locks-dir <path>]
+EOF
+}
+
+TIER="${1:-}"
+case "$TIER" in
+  personal|work|all) shift ;;
+  -h|--help) usage; exit 0 ;;
+  *) echo "kill: tier inválido o faltante: '$TIER' (debe ser personal|work|all)" >&2; usage; exit 2 ;;
+esac
+
+LOCKS_DIR="$REPO_ROOT/.state/locks"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --locks-dir) LOCKS_DIR="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "kill: argumento desconocido: $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+# --- RF-02..RF-04: termina un tier puntual ----------------------------------
+#
+# Punto crítico de diseño (spec 0007 (not in this snapshot) D2): "el lock desapareció" no
+# implica "el hijo murió" — el trap de scripts/session libera el lock apenas
+# EL WRAPPER recibe una señal que lo saca de su poll-loop, sin verificar que
+# el hijo real también haya muerto. Por eso hijo y lock se tratan acá como
+# dos objetivos independientes, confirmados por separado al final (RF-04.4),
+# nunca uno como proxy del otro.
+#
+# Lo que RF-02 detecta sobre el wrapper (vivo/muerto) sólo condiciona si la
+# Fase B se intenta o no (wrapper_pid vacío = no hay a quién señalizar ahí).
+# Nunca gatea ni salta la Fase A: esa corre siempre que RF-03 haya resuelto
+# child_pid, sin importar el estado del wrapper — de otro modo, un wrapper
+# ya muerto por SIGKILL externo (con su hijo real todavía vivo, huérfano)
+# dejaría a ese hijo sin cazar.
+kill_tier() {
+  local tier="$1" lockdir wrapper_pid child_pid i child_alive lock_exists rc
+
+  lockdir="$LOCKS_DIR/$tier.lock"
+
+  # RF-02: estado del tier.
+  if [ ! -d "$lockdir" ]; then
+    echo "kill: no hay sesión viva en el tier '$tier'" >&2
+    return 0
+  fi
+
+  wrapper_pid="$(cat "$lockdir/pid" 2>/dev/null || true)"
+  if [ -n "$wrapper_pid" ] && ! kill -0 "$wrapper_pid" 2>/dev/null; then
+    echo "kill: lock huérfano en '$tier' (PID $wrapper_pid no vive) — limpiando" >&2
+    wrapper_pid=""
+  fi
+
+  # RF-03: ventana de carrera de child_pid — poll con timeout, sin mirar el
+  # estado del wrapper (corre igual esté vivo o muerto).
+  i=0
+  while [ ! -f "$lockdir/child_pid" ] && [ "$i" -lt 50 ]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  child_pid=""
+  [ -f "$lockdir/child_pid" ] && child_pid="$(cat "$lockdir/child_pid" 2>/dev/null || true)"
+
+  # RF-04 Fase A (graceful, hijo).
+  if [ -n "$child_pid" ]; then
+    kill -TERM "$child_pid" 2>/dev/null || true
+  fi
+  i=0
+  while [ "$i" -lt 50 ]; do
+    child_alive=0
+    [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null && child_alive=1
+    lock_exists=0
+    [ -d "$lockdir" ] && lock_exists=1
+    [ "$child_alive" -eq 0 ] && [ "$lock_exists" -eq 0 ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  # RF-04 Fase B (nudge al wrapper) — sólo si sigue existiendo el lock y
+  # había un wrapper vivo detectado en RF-02.
+  if [ -d "$lockdir" ] && [ -n "$wrapper_pid" ]; then
+    kill -TERM "$wrapper_pid" 2>/dev/null || true
+    i=0
+    while [ -d "$lockdir" ] && [ "$i" -lt 50 ]; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+  fi
+
+  # RF-04 Fase C (forzado, independiente por objetivo).
+  if [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null; then
+    kill -KILL "$child_pid" 2>/dev/null || true
+  fi
+  if [ -d "$lockdir" ]; then
+    [ -n "$wrapper_pid" ] && kill -KILL "$wrapper_pid" 2>/dev/null || true
+    rm -rf "$lockdir"
+  fi
+
+  # Asiento tras la Fase C, mismo poll de convergencia que la Fase A: un
+  # "kill -KILL" no garantiza que "kill -0" reporte "muerto" en el
+  # instante siguiente — el reap real depende de que el padre verdadero
+  # (el wrapper, vía su propio "wait") le haga wait() al hijo; hasta
+  # entonces sigue siendo un zombie visible para kill -0 (RF-08/D5:
+  # mismo comportamiento ya documentado, no un mecanismo nuevo). Sin
+  # este poll, RF-04.4 podía reportar rc=1 por esta carrera de reap en
+  # vez de por un fallo real — confirmado empíricamente: el chequeo
+  # instantáneo daba rc=1 en corridas repetidas sin este poll.
+  i=0
+  while [ "$i" -lt 50 ]; do
+    child_alive=0
+    [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null && child_alive=1
+    lock_exists=0
+    [ -d "$lockdir" ] && lock_exists=1
+    [ "$child_alive" -eq 0 ] && [ "$lock_exists" -eq 0 ] && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  # RF-04.4: verificación final, cada objetivo por separado.
+  rc=0
+  [ -n "$child_pid" ] && kill -0 "$child_pid" 2>/dev/null && rc=1
+  [ -d "$lockdir" ] && rc=1
+  return "$rc"
+}
+
+# --- RF-07: "all" secuencial, tiers independientes --------------------------
+
+case "$TIER" in
+  all)
+    exit_code=0
+    kill_tier personal || { echo "kill: fallo al terminar el tier 'personal'" >&2; exit_code=1; }
+    kill_tier work || { echo "kill: fallo al terminar el tier 'work'" >&2; exit_code=1; }
+    exit "$exit_code"
+    ;;
+  *)
+    kill_tier "$TIER"
+    exit $?
+    ;;
+esac

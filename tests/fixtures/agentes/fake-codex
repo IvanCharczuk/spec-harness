@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# CLI falsa de codex para tests/agentes/agentes.sh (CA-04, CA-05 y CA-07 de
+# spec 0086 (not in this snapshot)).
+#
+# Contrato (C9 del plan):
+#   FAKE_CODEX_MODO  ok | falla-una-vez | mal | commitea
+#   FAKE_CODEX_DIR   donde graba argv-N y stdin-N (N = 1, 2, ...)
+#   FAKE_CODEX_ROOT  toplevel de git esperado (pwd -P)
+# Exit 9: argv distinto de `exec --model gpt-5-codex --sandbox workspace-write -`.
+# Exit 8: el toplevel de git no es FAKE_CODEX_ROOT (no escribe nada).
+set -euo pipefail
+
+: "${FAKE_CODEX_DIR:?fake-codex: falta FAKE_CODEX_DIR}"
+MODO="${FAKE_CODEX_MODO:-ok}"
+
+n=1
+while [ -e "$FAKE_CODEX_DIR/argv-$n" ]; do n=$((n + 1)); done
+printf '%s\n' "$@" > "$FAKE_CODEX_DIR/argv-$n"
+cat > "$FAKE_CODEX_DIR/stdin-$n"
+
+if [ $# -ne 6 ] || [ "$1" != "exec" ] || [ "$2" != "--model" ] || [ "$3" != "gpt-5-codex" ] \
+  || [ "$4" != "--sandbox" ] || [ "$5" != "workspace-write" ] || [ "$6" != "-" ]; then
+  echo "fake-codex: argv inesperado: $*" >&2
+  exit 9
+fi
+
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || top=""
+real=""
+[ -n "$top" ] && real="$(cd "$top" && pwd -P)"
+if [ -z "${FAKE_CODEX_ROOT:-}" ] || [ "$real" != "$FAKE_CODEX_ROOT" ]; then
+  echo "fake-codex: toplevel '$real' distinto de FAKE_CODEX_ROOT '${FAKE_CODEX_ROOT:-}'" >&2
+  exit 8
+fi
+
+case "$MODO" in
+  ok) printf 'hola\n' > "$real/salida.txt" ;;
+  falla-una-vez)
+    if grep -qF '## Resultado de la vuelta anterior' "$FAKE_CODEX_DIR/stdin-$n"; then
+      printf 'hola\n' > "$real/salida.txt"
+    else
+      printf 'mal\n' > "$real/salida.txt"
+    fi
+    ;;
+  mal) printf 'mal\n' > "$real/salida.txt" ;;
+  commitea)
+    printf 'hola\n' > "$real/salida.txt"
+    git -C "$real" add -A
+    git -C "$real" -c user.name=Fake -c user.email=tester@localhost \
+      -c core.hooksPath=/dev/null -c commit.gpgsign=false commit -q -m "fake-codex commitea"
+    ;;
+  *) echo "fake-codex: modo desconocido '$MODO'" >&2; exit 9 ;;
+esac
+echo "fake-codex: listo ($MODO)"

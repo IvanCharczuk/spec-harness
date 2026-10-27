@@ -1,0 +1,17 @@
+# Copia sin cambios de tests/fixtures/session_log/profiles-fake/personal.yaml
+# para spec 0008 (not in this snapshot) CA-13. No se ejercita en esa CA (no hay
+# sesión Tier A viva que matar) — está sólo para que --profiles-dir
+# tenga los dos tiers, mismo criterio que el resto de las fixtures de
+# perfiles de este repo.
+tier: personal
+claude_config_dir: ".state/claude/personal"
+dsh_home: ".state/dsh/personal"
+workspace_root: ".state/test-workspace-session-log"
+web_ui_port: 8843
+escalation_enabled: true
+claude_binary: "tests/fixtures/session_log/fake-claude"
+
+sandbox_backend: null
+plugins: []
+context_files: []
+approval_policy: null

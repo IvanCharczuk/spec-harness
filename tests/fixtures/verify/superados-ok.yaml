@@ -1,0 +1,7 @@
+# Fixture de tests/fixtures/verify (RF-01/RF-02 de specs/0046). Supera el
+# CA-02 de spec-superados.md con un superado_por real (0033, verified) para
+# que la entrada resulte válida.
+- spec: "9104"
+  ca: "CA-02"
+  superado_por: "0033"
+  motivo: "fixture de 0046: CA-02 superado a proposito para probar RF-02"

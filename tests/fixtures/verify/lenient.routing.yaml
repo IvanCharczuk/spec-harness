@@ -1,0 +1,17 @@
+# Fixture para CA-10 de spec 0005 (not in this snapshot): mismo formato que
+# config/routing.yaml, pero con max_manual_ratio permisivo, para probar
+# que scripts/verify --routing-config no tiene el umbral hardcodeado.
+
+weights:
+  S1: 3
+  S2: 2
+  S3: 2
+  S4: 4
+  S5: 1
+
+threshold_simple: 20
+threshold_complex: 40
+
+hard_exclusions: []
+
+max_manual_ratio: 0.9

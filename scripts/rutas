@@ -1,0 +1,1293 @@
+#!/usr/bin/env bash
+# RF-04 de specs/0021-rutas-agenticas-route-elige-un-workflow-de-subagentes-por-modo.md
+# Resuelve modo de trabajo -> workflows (config/rutas.yaml) y lintea el
+# catalogo de agentes y workflows. Determinístico, offline (RNF-05 de 0021).
+#
+# Delta de spec 0022 (not in this snapshot):
+# subcomandos `log` (RF-02), `--stats` (RF-03/RF-04) e `import` (RF-09) sobre
+# el registro `sessions/rutas.jsonl` (RF-01/§5.2). `cmd_mode`/`cmd_lint` y los
+# helpers YAML de 0021 no cambian (RNF-04 de 0022, CA-08): sólo se relaja el
+# dispatcher final para aceptar subcomandos con más de un argumento.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/routing.sh
+# Se sourcea (como hace scripts/spec) sólo para heredar resolve_spec/fm_field
+# (viven en lib/spec.sh, que routing.sh ya sourcea). spec_frontmatter_field de
+# common.sh no sirve acá: exige "---" en la primera línea y las specs de este
+# repo llevan el front-matter en un fence ```yaml (ver lib/spec.sh:fm_block).
+source "$SELF_DIR/lib/routing.sh"
+cd "$REPO_ROOT"
+
+RUTAS_CONFIG="config/rutas.yaml"
+AGENTS_DIR=".claude/agents"
+WORKFLOWS_DIR=".claude/workflows"
+DEFAULT_REGISTRO="sessions/rutas.jsonl"
+
+usage() {
+  cat >&2 <<'USAGE'
+uso:
+  scripts/rutas <modo>     imprime WORKFLOW=<ruta> por linea, en orden, para ese modo
+  scripts/rutas --lint     valida agentes (.claude/agents), workflows (.claude/workflows),
+                           la seccion perfiles y la seccion headless de config/rutas.yaml
+                           (RUTAS_LINT_CONFIG=<path> para lintear otro YAML; RF-07 de 0030)
+  scripts/rutas perfiles --spec <id|path> [--config <path>] [--registro <path>]
+                           resuelve banda/perfil/costo estimado por score (RF-02 de 0023)
+  scripts/rutas log --run-id <id> --spec <id> --workflow <basename.js>
+    --agentes <n> --agentes-error <n> --tokens <n> --duracion-ms <n>
+    --tool-uses <n> --pasa <true|false>
+    [--ca-total <n>] [--ca-pass <n>] [--segunda-vuelta <true|false>]
+    [--notas "<texto <=200>"] [--registro <path>] [--perfiles '<json>']
+                           agrega una linea validada a sessions/rutas.jsonl
+  scripts/rutas --stats [--registro <path>]
+                           reporta por workflow y TOTAL a partir del registro
+                           (y PERFIL= por banda si alguna corrida lo tiene)
+  scripts/rutas costo [--registro <path>]
+                           costo real por spec: registro cruzado con el
+                           SCORE/TIER/RULE actual de scripts/route (RF-04 de 0027)
+  scripts/rutas import --session <id|path> | --all
+    [--spec <id>] [--dry-run] [--registro <path>] [--slug <slug>] [--dir <path>]
+                           reconstruye corridas desde transcripts de sesiones
+                           (--dir busca los *.jsonl ahí en vez de
+                           ~/.claude/projects/<slug>; ignora --slug si vino)
+exit: 0 ok | 1 lint/--stats en rojo | 2 uso / modo inexistente / archivo
+  declarado ausente / log invalido / sesion de import inexistente /
+  perfiles: spec o config invalida / SCORE no numerico
+USAGE
+}
+
+# Lista plana bajo una clave de config/rutas.yaml: lineas "  - valor" hasta la
+# siguiente clave de nivel 0. Imprime los valores, en orden.
+yaml_list() {
+  local file="$1" key="$2"
+  awk -v k="$key" '
+    /^[^[:space:]#][^:]*:[[:space:]]*$/ { inkey = ($0 ~ "^"k":") ; next }
+    inkey && /^[[:space:]]+-[[:space:]]+/ { v=$0; sub(/^[[:space:]]+-[[:space:]]+/, "", v); sub(/[[:space:]]*#.*/, "", v); print v }
+  ' "$file"
+}
+
+yaml_has_key() {
+  grep -qE "^$2:[[:space:]]*$" "$1"
+}
+
+# Mismo envoltorio que usa el runtime de Workflow: `export const meta` queda
+# como const y el resto corre dentro de una funcion async (por eso el
+# `return` de nivel superior es valido ahi y no en un modulo suelto).
+check_workflow_syntax() {
+  { printf '(async () => {\n'; sed '1s/^export //' "$1"; printf '\n})\n'; } \
+    | node --input-type=module --check >/dev/null 2>&1
+}
+
+# --- perfiles: parseo/validacion de la seccion `perfiles` (RF-01/02/03 de
+# specs/0023) ------------------------------------------------------------------
+
+# Parsea la sección `perfiles` de un YAML tipo config/rutas.yaml línea a
+# línea (RNF-01: sin anidamiento más profundo que perfiles.bandas.<banda>.
+# <rol> en una sola línea "{ model: x, effort: y }") y la valida contra sus
+# propias listas modelos_validos/esfuerzos_validos (RNF-03: ningún alias
+# hardcodeado acá). Imprime a stdout un único JSON con lo parseado y una
+# clave `errors` (lista de strings, cada uno menciona "perfiles"). NUNCA hace
+# exit: cmd_perfiles corta con exit 2 ante cualquier error; cmd_lint acumula
+# print_fail y sigue — son rutas distintas que no comparten una función que
+# haga exit adentro.
+perfiles_config_json() {
+  local cfg="$1"
+  if [ ! -f "$cfg" ]; then
+    printf '{"errors":["perfiles: no existe %s"]}\n' "$cfg"
+    return 0
+  fi
+  node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    const text = fs.readFileSync(path, "utf8");
+    const lines = text.split("\n");
+    const errors = [];
+
+    const bandaNames = ["directo", "exhaustivo", "exhaustivo-critico"];
+    const roles = ["planificador", "implementador", "verificador", "refutador", "sintesis"];
+
+    const parseInlineList = (raw) => {
+      const m = raw.match(/\[([^\]]*)\]/);
+      if (!m) return null;
+      return m[1].split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+    };
+
+    let modelos_validos = null;
+    let esfuerzos_validos = null;
+    const bandas = {};
+
+    let inPerfiles = false, inBandas = false, curBanda = null;
+    for (const line of lines) {
+      if (/^perfiles:\s*$/.test(line)) { inPerfiles = true; inBandas = false; curBanda = null; continue; }
+      if (inPerfiles && /^[^\s#][^:]*:\s*$/.test(line)) {
+        inPerfiles = false; inBandas = false; curBanda = null;
+      }
+      if (!inPerfiles) continue;
+
+      let m;
+      if ((m = line.match(/^\s{2}modelos_validos:\s*(.*)$/))) { modelos_validos = parseInlineList(m[1]); continue; }
+      if ((m = line.match(/^\s{2}esfuerzos_validos:\s*(.*)$/))) { esfuerzos_validos = parseInlineList(m[1]); continue; }
+      // 0027 RF-03: `umbrales` ya no vive acá (los cortes son threshold_* de
+      // config/routing.yaml). Si la sección sigue presente (aun apendeada al
+      // final del archivo, como hace el fixture de CA-05), es un error de
+      // lint/perfiles, no una clave más para parsear.
+      if (/^\s{2}umbrales:\s*(#.*)?$/.test(line)) {
+        errors.push("perfiles: umbrales ya no vive acá, los cortes son threshold_* de config/routing.yaml");
+        inBandas = false; curBanda = null; continue;
+      }
+      if (/^\s{2}bandas:\s*(#.*)?$/.test(line)) { inBandas = true; curBanda = null; continue; }
+      if (!inBandas) continue;
+      if ((m = line.match(/^\s{4}([a-zA-Z0-9-]+):\s*(#.*)?$/))) { curBanda = m[1]; if (!bandas[curBanda]) bandas[curBanda] = {}; continue; }
+      if (!curBanda) continue;
+      if ((m = line.match(/^\s{6}panel:\s*\{\s*planificadores:\s*(\d+)\s*,\s*refutadores_por_plan:\s*(\d+)\s*\}/))) {
+        bandas[curBanda].panel = { planificadores: parseInt(m[1], 10), refutadores_por_plan: parseInt(m[2], 10) };
+        continue;
+      }
+      for (const rol of roles) {
+        const re = new RegExp("^\\s{6}" + rol + ":\\s*\\{\\s*model:\\s*([a-zA-Z0-9_-]+)\\s*,\\s*effort:\\s*([a-zA-Z0-9_-]+)\\s*\\}");
+        if ((m = line.match(re))) { bandas[curBanda][rol] = { model: m[1], effort: m[2] }; }
+      }
+    }
+
+    if (!Array.isArray(modelos_validos) || modelos_validos.length === 0) errors.push("perfiles: falta modelos_validos");
+    if (!Array.isArray(esfuerzos_validos) || esfuerzos_validos.length === 0) errors.push("perfiles: falta esfuerzos_validos");
+
+    const foundBandas = Object.keys(bandas);
+    for (const b of bandaNames) {
+      if (!bandas[b]) { errors.push(`perfiles: falta la banda ${b}`); continue; }
+      const banda = bandas[b];
+      const panel = banda.panel;
+      if (!panel || !Number.isInteger(panel.planificadores) || panel.planificadores < 1 || panel.planificadores > 5) {
+        errors.push(`perfiles: banda ${b} sin panel.planificadores entero 1..5`);
+      }
+      if (!panel || !Number.isInteger(panel.refutadores_por_plan) || panel.refutadores_por_plan < 1 || panel.refutadores_por_plan > 5) {
+        errors.push(`perfiles: banda ${b} sin panel.refutadores_por_plan entero 1..5`);
+      }
+      for (const rol of roles) {
+        const r = banda[rol];
+        if (!r) { errors.push(`perfiles: banda ${b} sin el rol ${rol}`); continue; }
+        if (!Array.isArray(modelos_validos) || !modelos_validos.includes(r.model)) {
+          errors.push(`perfiles: banda ${b} rol ${rol} model ${JSON.stringify(r.model)} no esta en modelos_validos`);
+        }
+        if (!Array.isArray(esfuerzos_validos) || !esfuerzos_validos.includes(r.effort)) {
+          errors.push(`perfiles: banda ${b} rol ${rol} effort ${JSON.stringify(r.effort)} no esta en esfuerzos_validos`);
+        }
+      }
+    }
+    for (const b of foundBandas) {
+      if (!bandaNames.includes(b)) errors.push(`perfiles: banda desconocida ${b} (no es directo/exhaustivo/exhaustivo-critico)`);
+    }
+
+    process.stdout.write(JSON.stringify({
+      modelos_validos, esfuerzos_validos,
+      bandas, errors,
+    }) + "\n");
+  ' "$cfg"
+}
+
+cmd_mode() {
+  local modo="$1"
+  [ -f "$RUTAS_CONFIG" ] || { echo "rutas: falta $RUTAS_CONFIG" >&2; exit 2; }
+  if ! yaml_has_key "$RUTAS_CONFIG" "$modo"; then
+    echo "rutas: modo '$modo' no declarado en $RUTAS_CONFIG" >&2
+    exit 2
+  fi
+  local out="" w
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    if [ ! -f "$w" ]; then
+      echo "rutas: '$modo' declara $w y no existe" >&2
+      exit 2
+    fi
+    out="${out}WORKFLOW=${w}"$'\n'
+  done < <(yaml_list "$RUTAS_CONFIG" "$modo")
+  [ -n "$out" ] || { echo "rutas: modo '$modo' sin workflows" >&2; exit 2; }
+  printf '%s' "$out"
+}
+
+cmd_lint() {
+  local ok=0 f n
+  [ -d "$AGENTS_DIR" ] || { print_fail "no existe $AGENTS_DIR"; return 1; }
+  [ -d "$WORKFLOWS_DIR" ] || { print_fail "no existe $WORKFLOWS_DIR"; return 1; }
+
+  n=0
+  for f in "$AGENTS_DIR"/*.md; do
+    [ -f "$f" ] || continue
+    n=$((n+1))
+    local missing=""
+    head -1 "$f" | grep -q '^---$' || missing="$missing front-matter"
+    grep -qE '^name:[[:space:]]*[^[:space:]]' "$f" || missing="$missing name"
+    grep -qE '^description:[[:space:]]*[^[:space:]]' "$f" || missing="$missing description"
+    grep -qE '^tools:[[:space:]]*[^[:space:]]' "$f" || missing="$missing tools"
+    if [ -z "$missing" ]; then
+      print_pass "agente $(basename "$f" .md): front-matter completo"
+    else
+      print_fail "agente $(basename "$f" .md): falta$missing"; ok=1
+    fi
+  done
+  [ "$n" -gt 0 ] || { print_fail "sin agentes en $AGENTS_DIR"; ok=1; }
+
+  n=0
+  for f in "$WORKFLOWS_DIR"/*.js; do
+    [ -f "$f" ] || continue
+    n=$((n+1))
+    local name; name="$(basename "$f")"
+    if ! head -1 "$f" | grep -q '^export const meta = {'; then
+      print_fail "workflow $name: no arranca con 'export const meta = {'"; ok=1; continue
+    fi
+    if grep -qE 'Date\.now|Math\.random|new Date\(\)' "$f"; then
+      print_fail "workflow $name: usa Date.now/Math.random/new Date() (rompe resume)"; ok=1; continue
+    fi
+    if check_workflow_syntax "$f"; then
+      print_pass "workflow $name: meta literal y sintaxis valida"
+    else
+      print_fail "workflow $name: error de sintaxis"; ok=1
+    fi
+  done
+  [ "$n" -gt 0 ] || { print_fail "sin workflows en $WORKFLOWS_DIR"; ok=1; }
+
+  # Todo lo declarado en rutas.yaml tiene que existir.
+  local key
+  for key in $(grep -E '^[^[:space:]#][^:]*:[[:space:]]*$' "$RUTAS_CONFIG" | sed 's/:.*//'); do
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if [ -f "$f" ]; then print_pass "rutas.yaml/$key -> $f existe"; else print_fail "rutas.yaml/$key -> $f no existe"; ok=1; fi
+    done < <(yaml_list "$RUTAS_CONFIG" "$key")
+  done
+
+  # Sección perfiles (RF-01/03 de specs/0023, RF-03 de 0027): bandas exactas,
+  # panel y roles completos, model/effort en las listas del propio YAML, y
+  # sin una sección `umbrales` propia (los cortes son threshold_* de
+  # config/routing.yaml). Un [FAIL] por problema (todos mencionan
+  # "perfiles"), acumula y sigue; no comparte con `cmd_perfiles` una función
+  # que haga exit adentro.
+  if [ -f "$RUTAS_CONFIG" ]; then
+    local perfiles_errors_n perfiles_json
+    perfiles_json="$(perfiles_config_json "$RUTAS_CONFIG")"
+    perfiles_errors_n="$(printf '%s' "$perfiles_json" | node -e 'const o=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(o.errors.length))')"
+    if [ "$perfiles_errors_n" = "0" ]; then
+      print_pass "rutas.yaml/perfiles: bandas, panel y roles completos"
+    else
+      while IFS= read -r msg; do
+        [ -n "$msg" ] || continue
+        print_fail "$msg"
+        ok=1
+      done < <(printf '%s' "$perfiles_json" | node -e 'const o=JSON.parse(require("fs").readFileSync(0,"utf8"));for (const e of o.errors) console.log(e)')
+    fi
+  else
+    print_fail "perfiles: falta $RUTAS_CONFIG"
+    ok=1
+  fi
+
+  # Sección headless (RF-02/RF-07 de
+  # spec 0030 (not in this snapshot)):
+  # cuatro claves presentes y con forma valida para `claude -p`. Un
+  # print_fail por problema (nombra su clave), acumula y sigue. La ruta del
+  # YAML sale de RUTAS_LINT_CONFIG si esta definida, si no de RUTAS_CONFIG
+  # (leida aca adentro para no pisar el despacho de flags de mas arriba, D10
+  # de 0030).
+  local hl_cfg="${RUTAS_LINT_CONFIG:-$RUTAS_CONFIG}"
+  if [ -f "$hl_cfg" ]; then
+    local hl_raw hl_session_model hl_permission_mode hl_max_turns hl_setting_sources hl_bg_wait_ms hl_timeout_min hl_ok
+    hl_raw="$(awk '
+      /^[^[:space:]#][^:]*:[[:space:]]*$/ { inkey = ($0 ~ "^headless:"); next }
+      inkey && /^[[:space:]]+session_model:/ { v=$0; sub(/^[[:space:]]+session_model:[[:space:]]*/,"",v); sub(/[[:space:]]*#.*/,"",v); sm=v }
+      inkey && /^[[:space:]]+permission_mode:/ { v=$0; sub(/^[[:space:]]+permission_mode:[[:space:]]*/,"",v); sub(/[[:space:]]*#.*/,"",v); pm=v }
+      inkey && /^[[:space:]]+max_turns:/ { v=$0; sub(/^[[:space:]]+max_turns:[[:space:]]*/,"",v); sub(/[[:space:]]*#.*/,"",v); mt=v }
+      inkey && /^[[:space:]]+setting_sources:/ { v=$0; sub(/^[[:space:]]+setting_sources:[[:space:]]*/,"",v); sub(/[[:space:]]*#.*/,"",v); ss=v }
+      inkey && /^[[:space:]]+bg_wait_ms:/ { v=$0; sub(/^[[:space:]]+bg_wait_ms:[[:space:]]*/,"",v); sub(/[[:space:]]*#.*/,"",v); bw=v }
+      inkey && /^[[:space:]]+timeout_min:/ { v=$0; sub(/^[[:space:]]+timeout_min:[[:space:]]*/,"",v); sub(/[[:space:]]*#.*/,"",v); tm=v }
+      END { print sm; print pm; print mt; print ss; print bw; print tm }
+    ' "$hl_cfg")"
+    hl_session_model="$(printf '%s\n' "$hl_raw" | sed -n '1p')"
+    hl_permission_mode="$(printf '%s\n' "$hl_raw" | sed -n '2p')"
+    hl_max_turns="$(printf '%s\n' "$hl_raw" | sed -n '3p')"
+    hl_setting_sources="$(printf '%s\n' "$hl_raw" | sed -n '4p')"
+    hl_bg_wait_ms="$(printf '%s\n' "$hl_raw" | sed -n '5p')"
+    hl_timeout_min="$(printf '%s\n' "$hl_raw" | sed -n '6p')"
+    hl_ok=1
+
+    if [ -z "$hl_session_model" ]; then
+      print_fail "rutas.yaml/headless: falta session_model"; hl_ok=0
+    elif ! printf '%s' "$hl_session_model" | grep -qE '^claude-[a-z0-9-]+-[0-9]{8}$' \
+      && ! printf '%s' "$hl_session_model" | grep -qE '^claude-[a-z]+-[0-9]+(-[0-9]+)?$'; then
+      print_fail "rutas.yaml/headless: session_model invalido ('$hl_session_model'), esperado ID completo (ej. claude-haiku-4-5-20251001), nunca un alias de una palabra"; hl_ok=0
+    fi
+
+    if [ -z "$hl_permission_mode" ]; then
+      print_fail "rutas.yaml/headless: falta permission_mode"; hl_ok=0
+    elif [ "$hl_permission_mode" != "acceptEdits" ] && [ "$hl_permission_mode" != "default" ]; then
+      print_fail "rutas.yaml/headless: permission_mode invalido ('$hl_permission_mode'), esperado acceptEdits o default"; hl_ok=0
+    fi
+
+    if [ -z "$hl_max_turns" ]; then
+      print_fail "rutas.yaml/headless: falta max_turns"; hl_ok=0
+    elif ! printf '%s' "$hl_max_turns" | grep -qE '^[0-9]+$' || [ "$hl_max_turns" -lt 1 ] || [ "$hl_max_turns" -gt 20 ]; then
+      print_fail "rutas.yaml/headless: max_turns invalido ('$hl_max_turns'), esperado entero entre 1 y 20"; hl_ok=0
+    fi
+
+    if [ -z "$hl_setting_sources" ]; then
+      print_fail "rutas.yaml/headless: falta setting_sources"; hl_ok=0
+    elif [ "$hl_setting_sources" != "project" ] && [ "$hl_setting_sources" != "project,local" ]; then
+      print_fail "rutas.yaml/headless: setting_sources invalido ('$hl_setting_sources'), esperado project o project,local"; hl_ok=0
+    fi
+
+    if [ -z "$hl_bg_wait_ms" ]; then
+      print_fail "rutas.yaml/headless: falta bg_wait_ms"; hl_ok=0
+    elif ! printf '%s' "$hl_bg_wait_ms" | grep -qE '^[0-9]+$'; then
+      print_fail "rutas.yaml/headless: bg_wait_ms invalido ('$hl_bg_wait_ms'), esperado entero >= 0"; hl_ok=0
+    fi
+
+    if [ -z "$hl_timeout_min" ]; then
+      print_fail "rutas.yaml/headless: falta timeout_min"; hl_ok=0
+    elif ! printf '%s' "$hl_timeout_min" | grep -qE '^[0-9]+$' || [ "$hl_timeout_min" -lt 1 ] || [ "$hl_timeout_min" -gt 600 ]; then
+      print_fail "rutas.yaml/headless: timeout_min invalido ('$hl_timeout_min'), esperado entero entre 1 y 600"; hl_ok=0
+    fi
+
+    if [ "$hl_ok" -eq 1 ]; then
+      print_pass "rutas.yaml/headless: session_model, permission_mode, max_turns, setting_sources, bg_wait_ms y timeout_min validos"
+    else
+      ok=1
+    fi
+  else
+    print_fail "rutas.yaml/headless: falta $hl_cfg"
+    ok=1
+  fi
+
+  # Sección permisos (RF-01/RF-03 de
+  # spec 0035 (not in this snapshot)):
+  # el deny tiene que traer las 13 reglas de RF-01, ninguna regla de allow
+  # puede matchear un patron prohibido (git destructivo, red, entorno,
+  # gestores de paquetes, señales de proceso) ni nombrar una ruta absoluta
+  # distinta de //tmp/**. Lee RUTAS_LINT_SETTINGS si esta definida (fixtures),
+  # si no .claude/settings.json. Un [FAIL] por regla faltante/prohibida/
+  # absoluta (todos mencionan "permisos"), acumula y sigue.
+  local perm_settings="${RUTAS_LINT_SETTINGS:-.claude/settings.json}"
+  if [ -f "$perm_settings" ]; then
+    local perm_ok=1 perm_out
+    perm_out="$(node -e '
+      const fs = require("fs");
+      let s;
+      try { s = JSON.parse(fs.readFileSync(process.argv[1], "utf8")); }
+      catch (e) { console.log("FAIL\tpermisos: JSON invalido en " + process.argv[1]); process.exit(0); }
+      const perms = (s && s.permissions) || {};
+      const deny = perms.deny || [];
+      const allow = perms.allow || [];
+      const requiredDeny = ["Bash(git checkout *)","Bash(git switch *)","Bash(git stash *)","Bash(git stash)","Bash(git restore *)","Bash(git reset --hard *)","Bash(git reset --hard)","Bash(git clean *)","Bash(git rebase *)","Bash(env)","Bash(printenv *)","Bash(printenv)"];
+      const forbiddenPatterns = [
+        "git checkout", "git switch", "git stash", "git restore", "git reset",
+        "git clean", "git push", "git rebase", "git rm", "curl", "wget",
+        "env", "printenv", "python3 -c", "npm", "pnpm", "npx", "kill",
+        "pkill", "nohup",
+      ];
+      let ok = true;
+      for (const rule of requiredDeny) {
+        if (!deny.includes(rule)) {
+          console.log("FAIL\tpermisos: falta en deny: " + rule);
+          ok = false;
+        }
+      }
+      for (const rule of allow) {
+        for (const pat of forbiddenPatterns) {
+          if (rule.includes(pat)) {
+            console.log("FAIL\tpermisos: regla de allow prohibida (" + pat + "): " + rule);
+            ok = false;
+            break;
+          }
+        }
+      }
+      for (const rule of allow) {
+        const m = rule.match(/\(([^)]*)\)/);
+        const body = m ? m[1] : rule;
+        for (const tok of body.split(/\s+/)) {
+          if (tok.startsWith("/") && tok !== "*" && !tok.startsWith("//tmp/")) {
+            console.log("FAIL\tpermisos: ruta absoluta en allow: " + rule);
+            ok = false;
+            break;
+          }
+        }
+      }
+      if (ok) console.log("OK");
+    ' "$perm_settings")"
+    while IFS=$'\t' read -r kind msg; do
+      [ -n "$kind" ] || continue
+      if [ "$kind" = "OK" ]; then
+        continue
+      fi
+      print_fail "$msg"
+      perm_ok=0
+    done <<< "$perm_out"
+    if [ "$perm_ok" -eq 1 ]; then
+      print_pass "permisos: deny completo, allow sin reglas prohibidas ni rutas absolutas"
+    else
+      ok=1
+    fi
+  else
+    print_fail "permisos: falta $perm_settings"
+    ok=1
+  fi
+
+  return $ok
+}
+
+# --- helpers de tipos (RF-02/RF-09 de 0022) ----------------------------------
+
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_bool() { [ "$1" = "true" ] || [ "$1" = "false" ]; }
+is_nullable_uint() { [ "$1" = "null" ] || is_uint "$1"; }
+is_nullable_bool() { [ "$1" = "null" ] || is_bool "$1"; }
+
+# Deriva el modo (directo|exhaustivo|rutina) de la clave de config/rutas.yaml
+# que lista ese workflow (comparando basename). Imprime el modo o nada.
+derive_modo() {
+  local workflow="$1" key w
+  for key in $(grep -E '^[^[:space:]#][^:]*:[[:space:]]*$' "$RUTAS_CONFIG" | sed 's/:.*//'); do
+    while IFS= read -r w; do
+      [ -n "$w" ] || continue
+      if [ "$(basename "$w")" = "$workflow" ]; then
+        case "$key" in
+          rutinas) printf 'rutina' ;;
+          *) printf '%s' "$key" ;;
+        esac
+        return 0
+      fi
+    done < <(yaml_list "$RUTAS_CONFIG" "$key")
+  done
+  return 1
+}
+
+# JSON de --perfiles (RF-05 de specs/0023): valida el crudo (objeto con
+# `banda` string y los cinco roles con `model`/`effort` strings) ANTES de que
+# build_line escriba nada; si es invalido, devuelve 1 sin imprimir (el
+# caller, build_line, no escribe). Si es valido, imprime a stdout el
+# subconjunto que se persiste: banda, panel (sólo si vino en el crudo) y los
+# cinco roles, en ese orden — nunca score, rule ni estimado (8.5 de 0023).
+# raw vacio => imprime "null" (perfiles: null, sin el flag).
+perfiles_persist_json() {
+  local raw="$1"
+  [ -n "$raw" ] || { echo "null"; return 0; }
+  node -e '
+    let obj;
+    try { obj = JSON.parse(process.argv[1]); } catch (e) { process.exit(1); }
+    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) process.exit(1);
+    if (typeof obj.banda !== "string") process.exit(1);
+    const roles = ["planificador", "implementador", "verificador", "refutador", "sintesis"];
+    for (const rol of roles) {
+      const r = obj[rol];
+      if (typeof r !== "object" || r === null) process.exit(1);
+      if (typeof r.model !== "string" || typeof r.effort !== "string") process.exit(1);
+    }
+    const persisted = { banda: obj.banda };
+    if (obj.panel !== undefined) persisted.panel = obj.panel;
+    for (const rol of roles) persisted[rol] = obj[rol];
+    process.stdout.write(JSON.stringify(persisted));
+  ' "$raw"
+}
+
+# Valida TODOS los campos de una corrida (§5.2) y, si son válidos, imprime la
+# línea JSON con las 17 claves en orden a stdout (return 0). Si algo falla,
+# imprime el motivo a stderr y devuelve 1 sin imprimir nada — no hace exit,
+# así el caller decide (`log` sale con exit 2; `import` lo trata como
+# corrida salteada). Única función que serializa una línea del registro:
+# la comparte `cmd_log` y `cmd_import` (RF-02/RF-09), no se duplica.
+#
+# build_line run_id spec_arg workflow agentes agentes_error tokens
+#            duracion_ms tool_uses pasa ca_total ca_pass segunda_vuelta
+#            notas [logged_at] [perfiles_json]
+# ca_total/ca_pass/segunda_vuelta: valor o literal "null". logged_at vacio =>
+# se calcula ahora (UTC); no vacio (import) => se usa tal cual. perfiles_json
+# es el parametro nuevo de 0023, AL FINAL, para no romper la llamada de
+# cmd_import (que sigue sin pasarlo): vacio => perfiles:null.
+build_line() {
+  local run_id="$1" spec_arg="$2" workflow="$3" agentes="$4" agentes_error="$5" \
+        tokens="$6" duracion_ms="$7" tool_uses="$8" pasa="$9" \
+        ca_total="${10}" ca_pass="${11}" segunda_vuelta="${12}" notas="${13}" \
+        logged_at="${14:-}" perfiles_arg="${15:-}"
+
+  [ -n "$run_id" ] || { echo "rutas: falta run-id" >&2; return 1; }
+  [ -n "$spec_arg" ] || { echo "rutas: falta spec" >&2; return 1; }
+  [ -n "$workflow" ] || { echo "rutas: falta workflow" >&2; return 1; }
+  is_uint "$agentes" || { echo "rutas: agentes no es entero" >&2; return 1; }
+  is_uint "$agentes_error" || { echo "rutas: agentes-error no es entero" >&2; return 1; }
+  is_uint "$tokens" || { echo "rutas: tokens no es entero" >&2; return 1; }
+  is_uint "$duracion_ms" || { echo "rutas: duracion-ms no es entero" >&2; return 1; }
+  is_uint "$tool_uses" || { echo "rutas: tool-uses no es entero" >&2; return 1; }
+  is_bool "$pasa" || { echo "rutas: pasa no es true|false" >&2; return 1; }
+  is_nullable_uint "$ca_total" || { echo "rutas: ca-total no es entero" >&2; return 1; }
+  is_nullable_uint "$ca_pass" || { echo "rutas: ca-pass no es entero" >&2; return 1; }
+  is_nullable_bool "$segunda_vuelta" || { echo "rutas: segunda-vuelta no es true|false" >&2; return 1; }
+
+  if ! node -e 'process.exit([...process.argv[1]].length<=200?0:1)' "$notas"; then
+    echo "rutas: notas supera 200 caracteres" >&2
+    return 1
+  fi
+
+  local specfile
+  if ! specfile="$(resolve_spec "$spec_arg" 2>/dev/null)" || [ ! -f "$specfile" ]; then
+    echo "rutas: spec '$spec_arg' inexistente" >&2
+    return 1
+  fi
+
+  local spec_id spec_version
+  spec_id="$(basename "$specfile" | grep -oE '^[0-9]{4}' || true)"
+  [ -n "$spec_id" ] || { echo "rutas: no se pudo derivar spec_id de $specfile" >&2; return 1; }
+  spec_version="$(fm_field "$specfile" version)"
+  is_uint "$spec_version" || { echo "rutas: spec_version invalido en $specfile" >&2; return 1; }
+
+  local modo
+  if ! modo="$(derive_modo "$workflow")" || [ -z "$modo" ]; then
+    echo "rutas: workflow '$workflow' no declarado en $RUTAS_CONFIG" >&2
+    return 1
+  fi
+
+  [ -n "$logged_at" ] || logged_at="$(date -u +%FT%TZ)"
+
+  local perfiles_out
+  if ! perfiles_out="$(perfiles_persist_json "$perfiles_arg")"; then
+    echo "rutas: --perfiles invalido (esperado objeto con banda y los cinco roles con model/effort)" >&2
+    return 1
+  fi
+
+  node -e '
+    const [run_id, logged_at, spec_id, spec_version, workflow, modo, agentes,
+      agentes_error, tokens, duracion_ms, tool_uses, pasa, ca_total, ca_pass,
+      segunda_vuelta, notas, perfiles_raw] = process.argv.slice(1);
+    const toInt = (s) => parseInt(s, 10);
+    const toNullableInt = (s) => (s === "null" ? null : parseInt(s, 10));
+    const toNullableBool = (s) => (s === "null" ? null : s === "true");
+    const o = {
+      run_id, logged_at, spec_id,
+      spec_version: toInt(spec_version),
+      workflow, modo,
+      agentes: toInt(agentes),
+      agentes_error: toInt(agentes_error),
+      tokens: toInt(tokens),
+      duracion_ms: toInt(duracion_ms),
+      tool_uses: toInt(tool_uses),
+      pasa: pasa === "true",
+      ca_total: toNullableInt(ca_total),
+      ca_pass: toNullableInt(ca_pass),
+      segunda_vuelta: toNullableBool(segunda_vuelta),
+      notas,
+      perfiles: JSON.parse(perfiles_raw),
+    };
+    process.stdout.write(JSON.stringify(o) + "\n");
+  ' "$run_id" "$logged_at" "$spec_id" "$spec_version" "$workflow" "$modo" \
+    "$agentes" "$agentes_error" "$tokens" "$duracion_ms" "$tool_uses" "$pasa" \
+    "$ca_total" "$ca_pass" "$segunda_vuelta" "$notas" "$perfiles_out"
+}
+
+# --- log (RF-02) --------------------------------------------------------------
+
+cmd_log() {
+  local run_id="" spec_arg="" workflow="" agentes="" agentes_error="" tokens="" \
+        duracion_ms="" tool_uses="" pasa="" ca_total="null" ca_pass="null" \
+        segunda_vuelta="null" notas="" registro="$DEFAULT_REGISTRO" perfiles_arg=""
+
+  while [ $# -gt 0 ]; do
+    local flag="$1"
+    case "$flag" in
+      --run-id|--spec|--workflow|--agentes|--agentes-error|--tokens|--duracion-ms|--tool-uses|--pasa|--ca-total|--ca-pass|--segunda-vuelta|--notas|--registro|--perfiles)
+        [ $# -ge 2 ] || { echo "rutas log: falta valor para $flag" >&2; exit 2; }
+        local val="$2"
+        shift 2
+        case "$flag" in
+          --run-id) run_id="$val" ;;
+          --spec) spec_arg="$val" ;;
+          --workflow) workflow="$val" ;;
+          --agentes) agentes="$val" ;;
+          --agentes-error) agentes_error="$val" ;;
+          --tokens) tokens="$val" ;;
+          --duracion-ms) duracion_ms="$val" ;;
+          --tool-uses) tool_uses="$val" ;;
+          --pasa) pasa="$val" ;;
+          --ca-total) ca_total="$val" ;;
+          --ca-pass) ca_pass="$val" ;;
+          --segunda-vuelta) segunda_vuelta="$val" ;;
+          --notas) notas="$val" ;;
+          --registro) registro="$val" ;;
+          --perfiles) perfiles_arg="$val" ;;
+        esac
+        ;;
+      *) echo "rutas log: flag desconocida '$flag'" >&2; exit 2 ;;
+    esac
+  done
+
+  if [ -z "$run_id" ] || [ -z "$spec_arg" ] || [ -z "$workflow" ] || [ -z "$agentes" ] \
+    || [ -z "$agentes_error" ] || [ -z "$tokens" ] || [ -z "$duracion_ms" ] \
+    || [ -z "$tool_uses" ] || [ -z "$pasa" ]; then
+    echo "rutas log: falta un flag obligatorio" >&2
+    exit 2
+  fi
+
+  local line
+  line="$(build_line "$run_id" "$spec_arg" "$workflow" "$agentes" "$agentes_error" \
+    "$tokens" "$duracion_ms" "$tool_uses" "$pasa" "$ca_total" "$ca_pass" \
+    "$segunda_vuelta" "$notas" "" "$perfiles_arg")" || exit 2
+
+  printf '%s\n' "$line" >> "$registro"
+  printf '%s\n' "$line"
+}
+
+# --- --stats (RF-03/RF-04) ----------------------------------------------------
+
+cmd_stats() {
+  local registro="$DEFAULT_REGISTRO"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --registro)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        registro="$2"; shift 2 ;;
+      *) usage; exit 2 ;;
+    esac
+  done
+
+  node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    let raw = "";
+    if (fs.existsSync(path)) { raw = fs.readFileSync(path, "utf8"); }
+    const rawLines = raw.split("\n");
+    const nonEmpty = [];
+    rawLines.forEach((l, i) => { if (l.trim() !== "") nonEmpty.push({ ln: i + 1, text: l }); });
+
+    if (nonEmpty.length === 0) {
+      console.log("RUTAS_STATS=sin corridas");
+      process.exit(0);
+    }
+
+    const REQUIRED_KEYS = [
+      "run_id", "logged_at", "spec_id", "spec_version", "workflow", "modo",
+      "agentes", "agentes_error", "tokens", "duracion_ms", "tool_uses", "pasa",
+      "ca_total", "ca_pass", "segunda_vuelta", "notas",
+    ];
+    const isInt = (v) => Number.isInteger(v);
+    const isNullableInt = (v) => v === null || Number.isInteger(v);
+    const isBool = (v) => typeof v === "boolean";
+    const isNullableBool = (v) => v === null || typeof v === "boolean";
+    const isStr = (v) => typeof v === "string";
+    const TYPE_CHECKS = [
+      ["run_id", isStr], ["logged_at", isStr], ["spec_id", isStr],
+      ["spec_version", isInt], ["workflow", isStr], ["modo", isStr],
+      ["agentes", isInt], ["agentes_error", isInt], ["tokens", isInt],
+      ["duracion_ms", isInt], ["tool_uses", isInt], ["pasa", isBool],
+      ["ca_total", isNullableInt], ["ca_pass", isNullableInt],
+      ["segunda_vuelta", isNullableBool], ["notas", isStr],
+    ];
+
+    const runs = [];
+    // Dedupe por run_id (RF-04 de specs/0026): merge=union puede duplicar una
+    // línea idéntica al fusionar dos ramas. La validación de claves y tipos
+    // corre igual para TODAS las líneas; el descarte pasa recién acá, en el
+    // push, y gana la primera aparición en orden de lectura.
+    const seenRunIds = new Set();
+    let dups = 0;
+    for (const { ln, text } of nonEmpty) {
+      let obj;
+      try {
+        obj = JSON.parse(text);
+      } catch (e) {
+        process.stderr.write(`[FAIL] línea ${ln}: JSON invalido\n`);
+        process.exit(1);
+      }
+      for (const k of REQUIRED_KEYS) {
+        if (!Object.prototype.hasOwnProperty.call(obj, k)) {
+          process.stderr.write(`[FAIL] línea ${ln}: falta el campo ${k}\n`);
+          process.exit(1);
+        }
+      }
+      for (const [k, fn] of TYPE_CHECKS) {
+        if (!fn(obj[k])) {
+          process.stderr.write(`[FAIL] línea ${ln}: tipo invalido en ${k}\n`);
+          process.exit(1);
+        }
+      }
+      // perfiles (RF-05 de specs/0023): clave nueva, ausente en las líneas
+      // ya registradas antes de 0023 — no entra en REQUIRED_KEYS. Ausente o
+      // null -> null; presente -> objeto con banda string.
+      if (!Object.prototype.hasOwnProperty.call(obj, "perfiles") || obj.perfiles === undefined) {
+        obj.perfiles = null;
+      } else if (obj.perfiles !== null) {
+        if (typeof obj.perfiles !== "object" || Array.isArray(obj.perfiles) || typeof obj.perfiles.banda !== "string") {
+          process.stderr.write(`[FAIL] línea ${ln}: tipo invalido en perfiles\n`);
+          process.exit(1);
+        }
+      }
+      if (seenRunIds.has(obj.run_id)) {
+        dups += 1;
+        continue;
+      }
+      seenRunIds.add(obj.run_id);
+      runs.push(obj);
+    }
+
+    const byWorkflow = new Map();
+    for (const r of runs) {
+      if (!byWorkflow.has(r.workflow)) byWorkflow.set(r.workflow, []);
+      byWorkflow.get(r.workflow).push(r);
+    }
+    const workflows = Array.from(byWorkflow.keys()).sort();
+
+    const median = (nums) => {
+      const s = nums.slice().sort((a, b) => a - b);
+      const n = s.length;
+      if (n % 2 === 1) return s[(n - 1) / 2];
+      return Math.round((s[n / 2 - 1] + s[n / 2]) / 2);
+    };
+
+    const block = (label, rs) => {
+      const n = rs.length;
+      const pasaN = rs.filter((r) => r.pasa === true).length;
+      const svInformed = rs.filter((r) => r.segunda_vuelta !== null);
+      const svTrue = svInformed.filter((r) => r.segunda_vuelta === true).length;
+      const svStr = svInformed.length > 0 ? `${svTrue}/${svInformed.length}` : "n/a";
+      const agentesProm = (rs.reduce((a, r) => a + r.agentes, 0) / n).toFixed(1);
+      const tokensTotal = rs.reduce((a, r) => a + r.tokens, 0);
+      const tokensProm = Math.round(tokensTotal / n);
+      const tokensMediana = median(rs.map((r) => r.tokens));
+      const duracionProm = (rs.reduce((a, r) => a + r.duracion_ms, 0) / n / 1000).toFixed(1);
+      const caInformed = rs.filter((r) => r.ca_total !== null);
+      const caSum = caInformed.reduce((a, r) => a + r.ca_total, 0);
+      const tokensPorCa = caInformed.length > 0 && caSum > 0 ? Math.round(tokensTotal / caSum) : "n/a";
+      return [
+        `${label} CORRIDAS=${n} PASA=${pasaN}/${n} SEGUNDA_VUELTA=${svStr}`,
+        `  AGENTES_PROM=${agentesProm} TOKENS_TOTAL=${tokensTotal} TOKENS_PROM=${tokensProm} TOKENS_MEDIANA=${tokensMediana}`,
+        `  DURACION_PROM_S=${duracionProm} TOKENS_POR_CA=${tokensPorCa}`,
+      ].join("\n");
+    };
+
+    // Desglose PERFIL= por banda, sólo debajo de cada WORKFLOW= (nunca en
+    // TOTAL) y sólo si alguna corrida de ese workflow tiene perfil (RF-05 de
+    // specs/0023). Sin perfiles, no agrega nada: runs-3.stats.expected de
+    // 0022 sigue byte a byte.
+    const perfilBlock = (rs) => {
+      const n = rs.length;
+      const pasaN = rs.filter((r) => r.pasa === true).length;
+      const tokensProm = Math.round(rs.reduce((a, r) => a + r.tokens, 0) / n);
+      const duracionProm = (rs.reduce((a, r) => a + r.duracion_ms, 0) / n / 1000).toFixed(1);
+      return `  PERFIL=${rs[0].perfiles.banda} CORRIDAS=${n} PASA=${pasaN}/${n} TOKENS_PROM=${tokensProm} DURACION_PROM_S=${duracionProm}`;
+    };
+
+    const out = [];
+    for (const w of workflows) {
+      const rs = byWorkflow.get(w);
+      out.push(block(`WORKFLOW=${w}`, rs));
+      const conPerfil = rs.filter((r) => r.perfiles !== null);
+      if (conPerfil.length > 0) {
+        const byBanda = new Map();
+        for (const r of conPerfil) {
+          if (!byBanda.has(r.perfiles.banda)) byBanda.set(r.perfiles.banda, []);
+          byBanda.get(r.perfiles.banda).push(r);
+        }
+        for (const banda of Array.from(byBanda.keys()).sort()) {
+          out.push(perfilBlock(byBanda.get(banda)));
+        }
+      }
+    }
+    out.push(block("TOTAL", runs));
+    console.log(out.join("\n"));
+    if (dups > 0) console.log("DUPLICADOS=" + dups);
+  ' "$registro"
+}
+
+# --- import (RF-09) -----------------------------------------------------------
+
+# Parsea un transcript de sesion y emite, por linea TSV, las corridas
+# completadas de la herramienta Workflow que pudo emparejar: run_id, spec,
+# workflow(basename), agentes, agentes_error, tokens, duracion_ms, tool_uses,
+# pasa, ca_total, ca_pass, segunda_vuelta, logged_at (D6 de 0022: formato
+# verificado sobre la sesion real de 0021).
+parse_session_transcript() {
+  local file="$1"
+  node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const file = process.argv[1];
+    const text = fs.readFileSync(file, "utf8");
+    const lines = text.split("\n");
+
+    const byToolUse = new Map();
+    const notifications = [];
+
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      let obj;
+      try {
+        obj = JSON.parse(line);
+      } catch (e) {
+        continue;
+      }
+
+      if (obj.type === "user" && obj.message && Array.isArray(obj.message.content)) {
+        for (const item of obj.message.content) {
+          if (item && item.type === "tool_result" && typeof item.content === "string" && item.tool_use_id) {
+            const scriptMatch = item.content.match(/Script file:\s*(\S+)/);
+            const runMatch = item.content.match(/Run ID:\s*(wf_\S+)/);
+            if (scriptMatch && runMatch) {
+              byToolUse.set(item.tool_use_id, {
+                workflow: path.basename(scriptMatch[1]),
+                run_id: runMatch[1],
+              });
+            }
+          }
+        }
+      }
+
+      if (obj.type === "queue-operation" && typeof obj.content === "string" && obj.content.includes("<task-notification>")) {
+        const c = obj.content;
+        const toolUseId = (c.match(/<tool-use-id>([^<]*)<\/tool-use-id>/) || [])[1];
+        const status = (c.match(/<status>([^<]*)<\/status>/) || [])[1];
+        const resultRaw = (c.match(/<result>([\s\S]*?)<\/result>/) || [])[1];
+        const usageRaw = (c.match(/<usage>([\s\S]*?)<\/usage>/) || [])[1];
+        const outputFile = (c.match(/<output-file>([^<]*)<\/output-file>/) || [])[1] || null;
+        if (toolUseId && status && resultRaw && usageRaw) {
+          notifications.push({ toolUseId, status, resultRaw, usageRaw, outputFile, timestamp: obj.timestamp });
+        }
+      }
+    }
+
+    const tag = (block, name) => {
+      const m = block.match(new RegExp(`<${name}>([^<]*)</${name}>`));
+      return m ? m[1] : null;
+    };
+
+    for (const n of notifications) {
+      if (n.status !== "completed") continue;
+      const match = byToolUse.get(n.toolUseId);
+      if (!match) continue;
+      // El transcript trunca <result> largos ("... (truncated N chars, full
+      // result in <output-file>)"). Orden: JSON del transcript; si no parsea,
+      // el archivo de salida de la tarea (campo result); si tampoco, regex
+      // sobre el prefijo truncado (spec/pasa/ca_* suelen venir primero).
+      let result = null;
+      try { result = JSON.parse(n.resultRaw); } catch (e) { result = null; }
+      if (result === null && n.outputFile && fs.existsSync(n.outputFile)) {
+        try {
+          const of = JSON.parse(fs.readFileSync(n.outputFile, "utf8"));
+          result = typeof of.result === "string" ? JSON.parse(of.result) : of.result;
+        } catch (e) { result = null; }
+      }
+      if (result === null || typeof result !== "object") {
+        const pick = (re) => { const m = n.resultRaw.match(re); return m ? m[1] : undefined; };
+        const spec = pick(/"spec":"([^"]+)"/);
+        if (!spec) continue;
+        const b = (v) => v === undefined ? undefined : v === "true";
+        const num = (v) => v === undefined || v === "null" ? null : Number(v);
+        result = {
+          spec,
+          pasa: b(pick(/"pasa":(true|false)/)),
+          ca_total: num(pick(/"ca_total":(\d+|null)/)),
+          ca_pass: num(pick(/"ca_pass":(\d+|null)/)),
+          segunda_vuelta: pick(/"segunda_vuelta":(true|false|null)/) === undefined ? null : (pick(/"segunda_vuelta":(true|false|null)/) === "null" ? null : pick(/"segunda_vuelta":(true|false|null)/) === "true"),
+        };
+      }
+      const agentCount = tag(n.usageRaw, "agent_count");
+      const agentsError = tag(n.usageRaw, "agents_error");
+      const subagentTokens = tag(n.usageRaw, "subagent_tokens");
+      const toolUses = tag(n.usageRaw, "tool_uses");
+      const durationMs = tag(n.usageRaw, "duration_ms");
+      if (agentCount === null || agentsError === null || subagentTokens === null || toolUses === null || durationMs === null) continue;
+      if (!n.timestamp) continue;
+      const loggedAt = String(n.timestamp).slice(0, 19) + "Z";
+      const fields = [
+        match.run_id,
+        result.spec !== undefined && result.spec !== null ? String(result.spec) : "",
+        match.workflow,
+        agentCount, agentsError, subagentTokens, durationMs, toolUses,
+        result.pasa === true ? "true" : "false",
+        result.ca_total === undefined || result.ca_total === null ? "null" : String(result.ca_total),
+        result.ca_pass === undefined || result.ca_pass === null ? "null" : String(result.ca_pass),
+        result.segunda_vuelta === undefined || result.segunda_vuelta === null ? "null" : (result.segunda_vuelta === true ? "true" : "false"),
+        loggedAt,
+      ];
+      console.log(fields.join("\t"));
+    }
+  ' "$file"
+}
+
+cmd_import() {
+  local session_arg="" do_all=0 spec_override="" dry_run=0 registro="$DEFAULT_REGISTRO" slug_override="" dir_override=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        session_arg="$2"; shift 2 ;;
+      --all) do_all=1; shift ;;
+      --spec)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        spec_override="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --registro)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        registro="$2"; shift 2 ;;
+      --slug)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        slug_override="$2"; shift 2 ;;
+      --dir)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        dir_override="$2"; shift 2 ;;
+      *) usage; exit 2 ;;
+    esac
+  done
+
+  [ "$do_all" -eq 1 ] || [ -n "$session_arg" ] || { usage; exit 2; }
+
+  # --dir (RF-04 de specs/0029): reemplaza la resolución de
+  # ~/.claude/projects/<slug> por un directorio explícito, para poder leer
+  # transcripts desde cualquier lado, no sólo del árbol de proyectos de la
+  # app de Claude Code. --slug se ignora (con aviso) si vinieron los dos.
+  local slug projects_dir
+  if [ -n "$dir_override" ]; then
+    [ -d "$dir_override" ] || { echo "rutas import: directorio inexistente: $dir_override" >&2; exit 2; }
+    [ -z "$slug_override" ] || echo "rutas import: --slug ignorado porque vino --dir" >&2
+    projects_dir="$dir_override"
+  else
+    # Slug de ~/.claude/projects/<slug> (RF-05 de specs/0026): --slug fuerza
+    # el valor; si no vino, se deriva del checkout PRINCIPAL (no de
+    # REPO_ROOT, que en un worktree de Orca es otro path) via `git rev-parse
+    # --git-common-dir` (devuelve `.git` relativo en el checkout principal,
+    # absoluto desde un worktree). Sin git o fuera de un repo, cae al
+    # REPO_ROOT actual.
+    if [ -n "$slug_override" ]; then
+      slug="$slug_override"
+    else
+      local common_dir="" main_root=""
+      if command -v git >/dev/null 2>&1 \
+        && common_dir="$(git -C "$REPO_ROOT" rev-parse --git-common-dir 2>/dev/null)"; then
+        case "$common_dir" in
+          /*) : ;;
+          *) common_dir="$REPO_ROOT/$common_dir" ;;
+        esac
+        main_root="$(dirname "$common_dir")"
+        slug="$(printf '%s' "$main_root" | sed 's/\//-/g')"
+      else
+        slug="$(printf '%s' "$REPO_ROOT" | sed 's/\//-/g')"
+      fi
+    fi
+    projects_dir="$HOME/.claude/projects/$slug"
+  fi
+
+  local -a files=()
+  if [ "$do_all" -eq 1 ]; then
+    if [ -d "$projects_dir" ]; then
+      while IFS= read -r f; do
+        files+=("$f")
+      done < <(find "$projects_dir" -maxdepth 1 -type f -name '*.jsonl' | sort)
+    fi
+  else
+    local sesspath
+    case "$session_arg" in
+      */*|*.jsonl) sesspath="$session_arg" ;;
+      *) sesspath="$projects_dir/$session_arg.jsonl" ;;
+    esac
+    [ -f "$sesspath" ] || { echo "rutas import: sesion inexistente: $sesspath" >&2; exit 2; }
+    files=("$sesspath")
+  fi
+
+  local import_count=0 skip_count=0 file
+  for file in "${files[@]-}"; do
+    [ -n "$file" ] || continue
+    local run_id spec workflow agentes agentes_error tokens duracion_ms tool_uses pasa ca_total ca_pass segunda_vuelta logged_at
+    while IFS=$'\t' read -r run_id spec workflow agentes agentes_error tokens duracion_ms tool_uses pasa ca_total ca_pass segunda_vuelta logged_at; do
+      [ -n "$run_id" ] || continue
+
+      if [ -f "$registro" ] && grep -qF "\"run_id\":\"$run_id\"" "$registro"; then
+        echo "[SKIP] $run_id: ya registrada" >&2
+        skip_count=$((skip_count + 1))
+        continue
+      fi
+
+      local spec_use="$spec"
+      [ -z "$spec_override" ] || spec_use="$spec_override"
+
+      local specfile
+      if ! specfile="$(resolve_spec "$spec_use" 2>/dev/null)" || [ ! -f "$specfile" ]; then
+        echo "[SKIP] $run_id: spec $spec_use inexistente (usá --spec)" >&2
+        skip_count=$((skip_count + 1))
+        continue
+      fi
+
+      local line
+      if ! line="$(build_line "$run_id" "$spec_use" "$workflow" "$agentes" "$agentes_error" \
+        "$tokens" "$duracion_ms" "$tool_uses" "$pasa" "$ca_total" "$ca_pass" \
+        "$segunda_vuelta" "" "$logged_at")"; then
+        echo "[SKIP] $run_id: datos invalidos" >&2
+        skip_count=$((skip_count + 1))
+        continue
+      fi
+
+      if [ "$dry_run" -eq 1 ]; then
+        printf '%s\n' "$line"
+      else
+        printf '%s\n' "$line" >> "$registro"
+      fi
+      import_count=$((import_count + 1))
+    done < <(parse_session_transcript "$file")
+  done
+
+  printf 'IMPORT=%s SKIP=%s\n' "$import_count" "$skip_count"
+}
+
+# --- perfiles (RF-02 de specs/0023) -------------------------------------------
+
+# Cuenta lineas "- **CA-<n>**" de una spec (§6): usa la regla fija de
+# estimado.agentes para ruta-exhaustivo-impl.js (p + 2*CA).
+count_ca_lines() {
+  grep -cE '^- \*\*CA-[0-9]+\*\*' "$1" 2>/dev/null || true
+}
+
+cmd_perfiles() {
+  local spec_arg="" cfg="$RUTAS_CONFIG" registro="$DEFAULT_REGISTRO"
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --spec)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        spec_arg="$2"; shift 2 ;;
+      --config)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        cfg="$2"; shift 2 ;;
+      --registro)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        registro="$2"; shift 2 ;;
+      *) usage; exit 2 ;;
+    esac
+  done
+  [ -n "$spec_arg" ] || { echo "rutas perfiles: falta --spec" >&2; exit 2; }
+
+  local specfile
+  if ! specfile="$(resolve_spec "$spec_arg" 2>/dev/null)" || [ ! -f "$specfile" ]; then
+    echo "rutas perfiles: spec '$spec_arg' inexistente" >&2
+    exit 2
+  fi
+
+  [ -f "$cfg" ] || { echo "rutas perfiles: falta $cfg" >&2; exit 2; }
+
+  # 1) score, tier y rule de scripts/route --spec (D6 de 0023: no se
+  # modifica route; se parsea su ultima linea de stdout). La banda ya no
+  # mira umbrales locales ni schema_change/arch_decision (0027 RF-03): sale
+  # de TIER/RULE, que route ya deriva de la escalera unica de
+  # config/routing.yaml (disparador duro incluido).
+  local route_out last score tier rule
+  route_out="$("$SELF_DIR/route" --spec "$specfile" 2>/dev/null)" || true
+  last="$(printf '%s\n' "$route_out" | tail -1)"
+  score="$(printf '%s' "$last" | sed -nE 's/.*SCORE=([^[:space:]]+).*/\1/p')"
+  tier="$(printf '%s' "$last" | sed -nE 's/.*TIER=([^[:space:]]+).*/\1/p')"
+  rule="$(printf '%s' "$last" | sed -nE 's/.*RULE=([^[:space:]]+).*/\1/p')"
+  if ! [[ "$score" =~ ^[0-9]+$ ]]; then
+    echo "rutas perfiles: scripts/route no devolvio un SCORE numerico para '$spec_arg' (¿--force con SCORE=-?)" >&2
+    exit 2
+  fi
+
+  # 2) config perfiles: parseo + validacion completa (exit 2 EXPLICITO ante
+  # cualquier falla — ruta distinta de --lint, que acumula).
+  local parsed errors_n
+  parsed="$(perfiles_config_json "$cfg")"
+  errors_n="$(printf '%s' "$parsed" | node -e 'const o=JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write(String(o.errors.length))')"
+  if [ "$errors_n" != "0" ]; then
+    printf '%s' "$parsed" | node -e 'const o=JSON.parse(require("fs").readFileSync(0,"utf8"));for (const e of o.errors) process.stderr.write("rutas perfiles: "+e+"\n")'
+    exit 2
+  fi
+
+  # 3) banda: disparador duro (RULE=hard-*, patron — cubre las 4 variantes)
+  # antes que score; sin umbrales propios.
+  local banda
+  case "$rule" in
+    hard-*) banda="exhaustivo-critico" ;;
+    *)
+      if [ "$tier" = "A" ]; then banda="directo"
+      elif [ "$rule" = "score-complex" ]; then banda="exhaustivo-critico"
+      else banda="exhaustivo"
+      fi
+      ;;
+  esac
+
+  # 4) modo -> workflows de esa ruta (config/rutas.yaml, mismo $cfg).
+  local modo
+  if [ "$banda" = "directo" ]; then modo="directo"; else modo="exhaustivo"; fi
+  local -a workflows=()
+  while IFS= read -r w; do
+    [ -n "$w" ] || continue
+    workflows+=("$(basename "$w")")
+  done < <(yaml_list "$cfg" "$modo")
+
+  local ca_count
+  ca_count="$(count_ca_lines "$specfile")"
+  [ -n "$ca_count" ] || ca_count=0
+
+  # 5) linea final: panel + 5 roles de la banda elegida, mas estimado (RF-02).
+  node -e '
+    const fs = require("fs");
+    const parsed = JSON.parse(process.argv[1]);
+    const banda = process.argv[2];
+    const score = parseInt(process.argv[3], 10);
+    const rule = process.argv[4];
+    const registro = process.argv[5];
+    const caCount = parseInt(process.argv[6], 10);
+    const workflows = process.argv.slice(7);
+
+    const band = parsed.bandas[banda];
+    const roles = ["planificador", "implementador", "verificador", "refutador", "sintesis"];
+
+    const median = (nums) => {
+      const s = nums.slice().sort((a, b) => a - b);
+      const n = s.length;
+      if (n % 2 === 1) return s[(n - 1) / 2];
+      return Math.round((s[n / 2 - 1] + s[n / 2]) / 2);
+    };
+
+    let raw = "";
+    if (fs.existsSync(registro)) raw = fs.readFileSync(registro, "utf8");
+    const rows = raw.split("\n").filter((l) => l.trim() !== "").map((l) => {
+      try { return JSON.parse(l); } catch (e) { return null; }
+    }).filter((r) => r !== null);
+    // RF-09 de 0086: las corridas de agentes no-Claude (notas "agente=<a>"
+    // con <a> != claude) traen tokens 0 porque no se miden; no entran ni en
+    // la mediana ni en corridas_base. --stats y costo las siguen contando.
+    const externo = (x) => {
+      const m = typeof x.notas === "string" ? /^agente=([^\s;]+)/.exec(x.notas) : null;
+      return !!m && m[1] !== "claude";
+    };
+    const rowsBase = rows.filter((x) => !externo(x));
+
+    let agentes = 0;
+    let tokens = 0;
+    let corridas_base = 0;
+    let tokensNull = false;
+    const p = band.panel.planificadores;
+    const r = band.panel.refutadores_por_plan;
+
+    for (const wf of workflows) {
+      let ag;
+      if (wf === "ruta-exhaustivo-plan.js") ag = p + p * r + 1;
+      else if (wf === "ruta-directo.js") ag = 4;
+      else if (wf === "ruta-exhaustivo-impl.js") ag = p + 2 * caCount;
+      else ag = 0;
+      agentes += ag;
+
+      if (tokensNull) continue;
+      let rs = rowsBase.filter((x) => x.workflow === wf);
+      const rb = rs.filter((x) => x.perfiles && x.perfiles.banda === banda);
+      if (rb.length > 0) rs = rb;
+      if (rs.length === 0) { tokensNull = true; continue; }
+      tokens += median(rs.map((x) => x.tokens));
+      corridas_base += rs.length;
+    }
+
+    const out = { banda, score, rule, panel: band.panel };
+    for (const rol of roles) out[rol] = band[rol];
+    out.estimado = { agentes, tokens: tokensNull ? null : tokens, corridas_base };
+    process.stdout.write(JSON.stringify(out) + "\n");
+  ' "$parsed" "$banda" "$score" "$rule" "$registro" "$ca_count" "${workflows[@]}"
+}
+
+# --- costo (RF-04 de specs/0027) ----------------------------------------------
+
+# Costo real por spec: agrupa el registro por spec_id (mismo dedupe por
+# run_id que --stats, gana la primera aparicion, RF-04 de 0026) y lo cruza
+# con el SCORE/TIER/RULE ACTUAL de cada spec via scripts/route --spec <id>
+# (solo lectura, no escribe nada). BANDA sale de perfiles.banda de las
+# corridas registradas, nunca del score de hoy: unica -> esa; mas de una ->
+# mixta; ninguna -> sin-perfil. Las corridas cuya spec ya no existe (fixture
+# borrado, id viejo) no imprimen linea propia: se acumulan en SIN_SPEC al
+# final. Registro vacio o inexistente -> RUTAS_COSTO=sin corridas, exit 0.
+cmd_costo() {
+  local registro="$DEFAULT_REGISTRO"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --registro)
+        [ $# -ge 2 ] || { usage; exit 2; }
+        registro="$2"; shift 2 ;;
+      *) usage; exit 2 ;;
+    esac
+  done
+
+  local grouped
+  grouped="$(node -e '
+    const fs = require("fs");
+    const path = process.argv[1];
+    let raw = "";
+    if (fs.existsSync(path)) raw = fs.readFileSync(path, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim() !== "");
+
+    // Dedupe por run_id (mismo criterio que --stats, RF-04 de 0026): gana
+    // la primera aparicion en orden de lectura.
+    const seenRunIds = new Set();
+    const bySpec = new Map();
+    for (const text of lines) {
+      let obj;
+      try { obj = JSON.parse(text); } catch (e) { continue; }
+      if (!obj || typeof obj.spec_id !== "string" || typeof obj.run_id !== "string") continue;
+      if (seenRunIds.has(obj.run_id)) continue;
+      seenRunIds.add(obj.run_id);
+      if (!bySpec.has(obj.spec_id)) bySpec.set(obj.spec_id, []);
+      bySpec.get(obj.spec_id).push(obj);
+    }
+
+    const specIds = Array.from(bySpec.keys()).sort();
+    for (const id of specIds) {
+      const rs = bySpec.get(id);
+      const corridas = rs.length;
+      const tokens = rs.reduce((a, r) => a + (Number.isInteger(r.tokens) ? r.tokens : 0), 0);
+      const agentes = rs.reduce((a, r) => a + (Number.isInteger(r.agentes) ? r.agentes : 0), 0);
+      const pasaN = rs.filter((r) => r.pasa === true).length;
+      const bandas = new Set(
+        rs.filter((r) => r.perfiles && typeof r.perfiles.banda === "string").map((r) => r.perfiles.banda)
+      );
+      let banda;
+      if (bandas.size === 0) banda = "sin-perfil";
+      else if (bandas.size === 1) banda = Array.from(bandas)[0];
+      else banda = "mixta";
+      console.log([id, corridas, tokens, agentes, pasaN, banda].join("\t"));
+    }
+  ' "$registro")"
+
+  if [ -z "$grouped" ]; then
+    echo "RUTAS_COSTO=sin corridas"
+    return 0
+  fi
+
+  local sin_spec=0
+  local id corridas tokens agentes pasaN banda
+  while IFS=$'\t' read -r id corridas tokens agentes pasaN banda; do
+    [ -n "$id" ] || continue
+    local specfile
+    if ! specfile="$(resolve_spec "$id" 2>/dev/null)" || [ ! -f "$specfile" ]; then
+      sin_spec=$((sin_spec + corridas))
+      continue
+    fi
+    local route_out last score tier rule
+    route_out="$("$SELF_DIR/route" --spec "$specfile" 2>/dev/null)" || true
+    last="$(printf '%s\n' "$route_out" | tail -1)"
+    score="$(printf '%s' "$last" | sed -nE 's/.*SCORE=([^[:space:]]+).*/\1/p')"
+    tier="$(printf '%s' "$last" | sed -nE 's/.*TIER=([^[:space:]]+).*/\1/p')"
+    rule="$(printf '%s' "$last" | sed -nE 's/.*RULE=([^[:space:]]+).*/\1/p')"
+    printf 'SPEC=%s SCORE=%s TIER=%s RULE=%s BANDA=%s CORRIDAS=%s TOKENS=%s AGENTES=%s PASA=%s/%s\n' \
+      "$id" "$score" "$tier" "$rule" "$banda" "$corridas" "$tokens" "$agentes" "$pasaN" "$corridas"
+  done <<< "$grouped"
+
+  [ "$sin_spec" -eq 0 ] || printf 'SIN_SPEC=%s\n' "$sin_spec"
+}
+
+case "${1:-}" in
+  perfiles) shift; cmd_perfiles "$@" ;;
+  log) shift; cmd_log "$@" ;;
+  --stats) shift; cmd_stats "$@" ;;
+  costo) shift; cmd_costo "$@" ;;
+  import) shift; cmd_import "$@" ;;
+  --lint)
+    [ $# -eq 1 ] || { usage; exit 2; }
+    cmd_lint
+    ;;
+  -h|--help) if [ $# -eq 1 ]; then usage; exit 0; else usage; exit 2; fi ;;
+  --*) usage; exit 2 ;;
+  "") usage; exit 2 ;;
+  *)
+    [ $# -eq 1 ] || { usage; exit 2; }
+    cmd_mode "$1"
+    ;;
+esac

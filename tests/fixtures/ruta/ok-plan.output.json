@@ -1,0 +1,57 @@
+{
+  "result": {
+    "spec": "0028",
+    "pasa": true,
+    "plan": {
+      "enfoque": "Separar el cambio en dos grupos: nucleo del script y fixtures de prueba, sin tocar los workflows existentes.",
+      "grupos": [
+        {
+          "nombre": "G1 - nucleo",
+          "archivos": [
+            "scripts/ruta"
+          ],
+          "descripcion": "Implementa el script que resuelve workflow y perfiles, lanza la sesion headless y registra la corrida.",
+          "ca_cubiertas": [
+            "CA-01",
+            "CA-04",
+            "CA-06",
+            "CA-07"
+          ],
+          "comparte_archivos": false
+        },
+        {
+          "nombre": "G2 - fixtures",
+          "archivos": [
+            "tests/fixtures/ruta/fake-claude",
+            "tests/fixtures/ruta/ok-directo.jsonl"
+          ],
+          "descripcion": "Fixtures enlatados para probar el script sin depender del binario claude real.",
+          "ca_cubiertas": [
+            "CA-02",
+            "CA-03",
+            "CA-05"
+          ],
+          "comparte_archivos": false
+        }
+      ],
+      "casos_borde": [
+        "Que pasa si el registro temporal esta vacio antes de la corrida.",
+        "Que pasa si falta un flag obligatorio del claude falso.",
+        "Que pasa si el resultado no trae task_notification."
+      ],
+      "supuestos": [
+        "La spec 0028 queda en verified durante toda la implementacion de 0030.",
+        "El binario claude real no esta disponible en el entorno de implementacion."
+      ],
+      "diagrama": "capas:\n  - { id: cli, nombre: CLI }\n  - { id: repo, nombre: Repo }\nparticipantes:\n  - { id: Op, nombre: \"operador\", capa: cli, hace: \"Corre scripts/ruta directo 0028\", vive_en: [\"scripts/ruta\"] }\n  - { id: Im, nombre: \"implementador\", capa: repo, hace: \"Implementa la spec 0028 dentro de su alcance\", vive_en: [\".claude/agents/implementador.md\"] }\n  - { id: Ve, nombre: \"verificador\", capa: repo, hace: \"Corre scripts/verify y devuelve el desglose por CA\", vive_en: [\".claude/agents/verificador.md\"] }\nsecuencia:\n  - { de: Op, a: Im, msg: \"Implementa la spec 0028\", tipo: peticion, activa: true }\n  - { de: Im, a: Ve, msg: \"listo para verificar\", tipo: peticion }\n  - { de: Ve, a: Op, msg: \"desglose por CA\", tipo: respuesta }\n  - alt: \"todos los CA en PASS\"\n    pasos:\n      - { de: Ve, a: Op, msg: \"pasa: true\", tipo: respuesta }\n    else: \"algun CA en FAIL\"\n    pasos_else:\n      - { de: Ve, a: Op, msg: \"segunda vuelta\", tipo: respuesta }"
+    },
+    "reparos": [],
+    "candidatos": [],
+    "ca_total": null,
+    "ca_pass": null,
+    "segunda_vuelta": null
+  },
+  "agentCount": 5,
+  "totalTokens": 245613,
+  "totalToolCalls": 61
+}

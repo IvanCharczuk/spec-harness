@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Binario mock para las CA de spec 0004 (not in this snapshot) (RF-02): sustituye
+# al binario real del tier vía claude_binary en un perfil de test, para
+# probar gate/lock/paralelismo sin abrir sesiones reales de Claude Code.
+if [ -n "${FAKE_CLAUDE_CAPTURE:-}" ]; then
+  {
+    echo "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-}"
+    echo "DSH_HOME=${DSH_HOME:-}"
+    echo "SESSION_WEB_UI_PORT=${SESSION_WEB_UI_PORT:-}"
+    echo "SESSION_TIER=${SESSION_TIER:-}"
+    echo "SESSION_SPEC_ID=${SESSION_SPEC_ID:-}"
+  } > "$FAKE_CLAUDE_CAPTURE"
+fi
+sleep "${FAKE_CLAUDE_SLEEP:-0}"
+exit "${FAKE_CLAUDE_EXIT:-0}"

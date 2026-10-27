@@ -1,0 +1,594 @@
+#!/usr/bin/env node
+// RF-01, RF-02, RF-03, RF-05 (lint), RF-06 y RF-06b (v2) de
+// spec 0086 (not in this snapshot)
+// (RF-04 y RF-07/08 viven en scripts/ruta, que consume este script).
+//
+// Roles neutros (agentes/roles/<rol>.md) + config/agentes.yaml:
+//   scripts/agentes generar [--check]
+//   scripts/agentes prompt --rol <rol> --spec <id|ruta> [--sin-herramientas] [--extra <archivo>]
+//   scripts/agentes pedir --agente ollama --prompt-file <f> --schema <f>
+//                         [--model <m>] [--url <u>]
+//   scripts/agentes --lint
+//
+// Config: AGENTES_CONFIG=<path> (relativo al cwd) o <repo>/config/agentes.yaml.
+// JavaScript plano, sin dependencias (RNF-01 de 0086): fs, path, crypto y
+// fetch nativo. Nunca reintenta en silencio (RF-03).
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+const REPO_ROOT = path.resolve(__dirname, '..');
+const PEDIR_TIMEOUT_MS = 180000; // RNF-05 de 0086
+const FLAGS_PROHIBIDAS = ['--dangerously', 'bypass', '--yolo', '--force', 'danger-full-access'];
+
+const USO = `uso:
+  scripts/agentes generar [--check]
+  scripts/agentes prompt --rol <rol> --spec <id|ruta> [--sin-herramientas] [--extra <archivo>]
+  scripts/agentes pedir --agente ollama --prompt-file <f> --schema <f> [--model <m>] [--url <u>]
+  scripts/agentes --lint
+config: AGENTES_CONFIG=<path> o config/agentes.yaml
+`;
+
+class Salida extends Error {
+  constructor(code, msg) {
+    super(msg || '');
+    this.code = code;
+  }
+}
+
+function fallar(code, msg) {
+  throw new Salida(code, msg);
+}
+
+// --- config --------------------------------------------------------------
+
+function configPath() {
+  const env = process.env.AGENTES_CONFIG;
+  if (env !== undefined && env !== '') return path.resolve(process.cwd(), env);
+  return path.join(REPO_ROOT, 'config', 'agentes.yaml');
+}
+
+// Valor escalar: entre comillas dobles es literal (sin escapes); sin
+// comillas se corta el comentario `#` y true/false son booleanos.
+function parseValor(crudo, nl) {
+  const v = crudo.trim();
+  if (v === '') return '';
+  if (v[0] === '"') {
+    const fin = v.indexOf('"', 1);
+    if (fin < 0) fallar(2, `línea ${nl}: comilla sin cerrar`);
+    const resto = v.slice(fin + 1).trim();
+    if (resto !== '' && resto[0] !== '#') fallar(2, `línea ${nl}: texto después de la comilla`);
+    return v.slice(1, fin);
+  }
+  const hash = v.search(/(^|\s)#/);
+  const sinComentario = (hash < 0 ? v : v.slice(0, hash)).trim();
+  if (sinComentario === 'true') return true;
+  if (sinComentario === 'false') return false;
+  return sinComentario;
+}
+
+// YAML mínimo de C2: `seccion:` / `  nombre:` / `    campo: valor`.
+function parseYaml(texto) {
+  const out = {};
+  let seccion = null;
+  let entrada = null;
+  const lineas = texto.split('\n');
+  for (let i = 0; i < lineas.length; i++) {
+    const nl = i + 1;
+    const linea = lineas[i].replace(/\r$/, '');
+    const t = linea.trim();
+    if (t === '' || t[0] === '#') continue;
+    const m = /^( *)([A-Za-z0-9_.-]+):(.*)$/.exec(linea);
+    if (!m) fallar(2, `línea ${nl}: no se entiende '${t}'`);
+    const ind = m[1].length;
+    const clave = m[2];
+    const resto = m[3];
+    const vacio = resto.trim() === '' || resto.trim()[0] === '#';
+    if (ind === 0) {
+      if (vacio) {
+        if (Object.prototype.hasOwnProperty.call(out, clave)) fallar(2, `línea ${nl}: sección '${clave}' repetida`);
+        out[clave] = {};
+        seccion = clave;
+      } else {
+        out[clave] = parseValor(resto, nl);
+        seccion = null;
+      }
+      entrada = null;
+    } else if (ind === 2) {
+      if (seccion === null) fallar(2, `línea ${nl}: '${clave}' fuera de una sección`);
+      if (!vacio) fallar(2, `línea ${nl}: '${clave}' tendría que abrir un bloque`);
+      if (Object.prototype.hasOwnProperty.call(out[seccion], clave)) fallar(2, `línea ${nl}: '${clave}' repetido en '${seccion}'`);
+      out[seccion][clave] = {};
+      entrada = clave;
+    } else if (ind === 4) {
+      if (seccion === null || entrada === null) fallar(2, `línea ${nl}: '${clave}' fuera de un bloque`);
+      const bloque = out[seccion][entrada];
+      if (Object.prototype.hasOwnProperty.call(bloque, clave)) fallar(2, `línea ${nl}: '${clave}' repetido en '${entrada}'`);
+      bloque[clave] = parseValor(resto, nl);
+    } else {
+      fallar(2, `línea ${nl}: indentación de ${ind} espacios (se esperan 0, 2 o 4)`);
+    }
+  }
+  return out;
+}
+
+function cargarConfig() {
+  const p = configPath();
+  let texto;
+  try {
+    texto = fs.readFileSync(p, 'utf8');
+  } catch (e) {
+    fallar(2, `falta ${p}`);
+  }
+  try {
+    return parseYaml(texto);
+  } catch (e) {
+    if (e instanceof Salida) fallar(2, `${p}: ${e.message}`);
+    throw e;
+  }
+}
+
+function seccion(cfg, nombre) {
+  const s = cfg[nombre];
+  return s && typeof s === 'object' ? s : null;
+}
+
+// --- argumentos ----------------------------------------------------------
+
+function parseFlags(argv, conValor, sinValor) {
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (sinValor.includes(a)) {
+      flags[a] = true;
+    } else if (conValor.includes(a)) {
+      if (i + 1 >= argv.length || argv[i + 1] === '') fallar(2, `${a} requiere un valor`);
+      flags[a] = argv[++i];
+    } else {
+      fallar(2, `argumento desconocido '${a}'\n${USO}`);
+    }
+  }
+  return flags;
+}
+
+// --- roles ---------------------------------------------------------------
+
+function rutaRol(rol) {
+  return path.join(REPO_ROOT, 'agentes', 'roles', `${rol}.md`);
+}
+
+function leerRol(rol) {
+  if (!/^[a-z][a-z0-9_-]*$/.test(rol)) fallar(2, `rol inválido '${rol}'`);
+  try {
+    return fs.readFileSync(rutaRol(rol));
+  } catch (e) {
+    fallar(2, `falta agentes/roles/${rol}.md`);
+  }
+}
+
+// RF-02: frontmatter de Claude + línea en blanco + cuerpo neutro.
+function cmdGenerar(argv) {
+  const flags = parseFlags(argv, [], ['--check']);
+  const check = flags['--check'] === true;
+  const cfg = cargarConfig();
+  const roles = seccion(cfg, 'roles');
+  if (!roles || Object.keys(roles).length === 0) fallar(2, `${configPath()}: falta la sección roles`);
+
+  // Todo lo que da exit 2 se resuelve antes de comparar o escribir.
+  const planes = [];
+  for (const rol of Object.keys(roles)) {
+    const meta = roles[rol];
+    for (const campo of ['description', 'claude_tools']) {
+      if (typeof meta[campo] !== 'string' || meta[campo] === '') fallar(2, `${configPath()}: roles.${rol}: falta ${campo}`);
+    }
+    const cuerpo = leerRol(rol);
+    const cabecera = `---\nname: ${rol}\ndescription: ${meta.description}\ntools: ${meta.claude_tools}\n---\n\n`;
+    const contenido = Buffer.concat([Buffer.from(cabecera, 'utf8'), cuerpo]);
+    const destino = path.join(REPO_ROOT, '.claude', 'agents', `${rol}.md`);
+    let actual = null;
+    try {
+      actual = fs.readFileSync(destino);
+    } catch (e) {
+      actual = null;
+    }
+    planes.push({ rol, contenido, destino, igual: actual !== null && actual.equals(contenido) });
+  }
+
+  const distintos = planes.filter((p) => !p.igual);
+  let out = '';
+  if (check) {
+    if (distintos.length === 0) {
+      out = `generar: sin diferencias (${planes.length} roles)\n`;
+    } else {
+      out = distintos.map((p) => `generar: ${p.rol} difiere\n`).join('');
+    }
+    process.stdout.write(out);
+    return distintos.length === 0 ? 0 : 1;
+  }
+  if (distintos.length === 0) {
+    process.stdout.write(`generar: sin diferencias (${planes.length} roles)\n`);
+    return 0;
+  }
+  for (const p of distintos) {
+    fs.mkdirSync(path.dirname(p.destino), { recursive: true });
+    fs.writeFileSync(p.destino, p.contenido);
+    out += `generar: ${p.rol} escrito\n`;
+  }
+  process.stdout.write(out);
+  return 0;
+}
+
+// --- prompt (RF-06, bytes exactos de C3) ---------------------------------
+
+function resolverSpec(arg) {
+  let abs;
+  if (arg.includes('/') || arg.endsWith('.md')) {
+    abs = path.resolve(process.cwd(), arg);
+  } else {
+    let nombres = [];
+    try {
+      nombres = fs.readdirSync(path.join(REPO_ROOT, 'specs'));
+    } catch (e) {
+      nombres = [];
+    }
+    const match = nombres.filter((n) => n.startsWith(`${arg}-`) && n.endsWith('.md')).sort();
+    if (match.length === 0) fallar(2, `no existe la spec '${arg}'`);
+    abs = path.join(REPO_ROOT, 'specs', match[0]);
+  }
+  let real;
+  try {
+    real = fs.realpathSync(abs);
+    if (!fs.statSync(real).isFile()) throw new Error('no es archivo');
+  } catch (e) {
+    fallar(2, `no existe la spec '${arg}'`);
+  }
+  const rel = path.relative(fs.realpathSync(REPO_ROOT), real);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) fallar(2, `la spec '${arg}' está fuera del repo`);
+  return rel.split(path.sep).join('/');
+}
+
+// RF-06b (v2): lo que un agente sin herramientas no puede leer por su
+// cuenta. Las entradas de §5.1 usan la misma regla que ruta_ext_allow de
+// scripts/ruta (no indentadas, primer token); los CA, el `cmd` de cada
+// `check:` (los `manual: true` no tienen y no van). Nada más de la spec.
+function permitidos51(lineas) {
+  const out = [];
+  let in51 = false;
+  let fence = false;
+  for (const l of lineas) {
+    if (!in51) {
+      if (/^### 5\.1/.test(l)) in51 = true;
+      continue;
+    }
+    if (/^###? /.test(l)) break;
+    if (/^```/.test(l)) {
+      fence = !fence;
+      continue;
+    }
+    if (fence && /^\S/.test(l)) out.push(l.split(/\s+/)[0]);
+  }
+  return out;
+}
+
+function desescaparYaml(v) {
+  return v.replace(/\\(["\\])/g, '$1');
+}
+
+function criteriosCa(lineas) {
+  const out = [];
+  let in6 = false;
+  let ca = null;
+  for (let i = 0; i < lineas.length; i++) {
+    const l = lineas[i];
+    if (!in6) {
+      if (/^## 6\./.test(l)) in6 = true;
+      continue;
+    }
+    if (/^## /.test(l)) break;
+    const m = /^- \*\*(CA-\d+)\*\*/.exec(l);
+    if (m) {
+      ca = m[1];
+      continue;
+    }
+    if (!ca) continue;
+    const c = /^(\s*)cmd:\s*(.*)$/.exec(l);
+    if (!c) continue;
+    const ind = c[1].length;
+    const v = c[2].trim();
+    if (v === '|' || v === '|-') {
+      const cuerpo = [];
+      for (i = i + 1; i < lineas.length; i++) {
+        const x = lineas[i];
+        if (x.trim() !== '' && x.length - x.trimStart().length <= ind) break;
+        cuerpo.push(x);
+      }
+      i--;
+      while (cuerpo.length && cuerpo[cuerpo.length - 1].trim() === '') cuerpo.pop();
+      const min = Math.min(...cuerpo.filter((x) => x.trim() !== '').map((x) => x.length - x.trimStart().length));
+      out.push({ ca, lineas: cuerpo.map((x) => (x.trim() === '' ? '' : x.slice(min))) });
+    } else {
+      let cmd = v;
+      if (cmd.length >= 2 && cmd[0] === '"' && cmd[cmd.length - 1] === '"') cmd = desescaparYaml(cmd.slice(1, -1));
+      else if (cmd.length >= 2 && cmd[0] === "'" && cmd[cmd.length - 1] === "'") cmd = cmd.slice(1, -1).replace(/''/g, "'");
+      out.push({ ca, lineas: [cmd] });
+    }
+    ca = null;
+  }
+  return out;
+}
+
+function bloqueSinHerramientas(specRel) {
+  const lineas = fs.readFileSync(path.join(REPO_ROOT, specRel), 'utf8').split('\n');
+  let t = '\n## Archivos permitidos (§5.1)\n\n';
+  for (const p of permitidos51(lineas)) t += `- \`${p}\`\n`;
+  t += '\n## Criterios a cumplir\n\n';
+  for (const { ca, lineas: ls } of criteriosCa(lineas)) {
+    if (ls.length === 1) t += `- ${ca}: \`${ls[0]}\`\n`;
+    else t += `- ${ca}:\n\n  \`\`\`\n${ls.map((x) => (x === '' ? '' : `  ${x}`)).join('\n')}\n  \`\`\`\n`;
+  }
+  return Buffer.from(t, 'utf8');
+}
+
+function cmdPrompt(argv) {
+  const flags = parseFlags(argv, ['--rol', '--spec', '--extra'], ['--sin-herramientas']);
+  if (!flags['--rol'] || !flags['--spec']) fallar(2, `prompt requiere --rol y --spec\n${USO}`);
+  cargarConfig(); // C1: una AGENTES_CONFIG inexistente es exit 2 en todos los subcomandos.
+  const cuerpo = leerRol(flags['--rol']);
+  const specRel = resolverSpec(flags['--spec']);
+  let extra = null;
+  if (flags['--extra'] !== undefined) {
+    try {
+      extra = fs.readFileSync(path.resolve(process.cwd(), flags['--extra']));
+    } catch (e) {
+      fallar(2, `falta ${flags['--extra']}`);
+    }
+  }
+  const partes = [
+    cuerpo,
+    Buffer.from(
+      '\n## Contexto\n\n' +
+        `- Spec activa: \`${specRel}\`.\n` +
+        '- Leé `AGENTS.md` antes de actuar.\n' +
+        '- No commitees.\n' +
+        '- No pushees.\n' +
+        '- No salgas del §Alcance de la spec.\n',
+      'utf8',
+    ),
+  ];
+  if (flags['--sin-herramientas']) partes.push(bloqueSinHerramientas(specRel));
+  if (extra !== null) {
+    partes.push(Buffer.from('\n## Resultado de la vuelta anterior\n\n', 'utf8'), extra);
+    if (extra.length === 0 || extra[extra.length - 1] !== 0x0a) partes.push(Buffer.from('\n', 'utf8'));
+  }
+  process.stdout.write(Buffer.concat(partes));
+  return 0;
+}
+
+// --- pedir (RF-03, C6) ---------------------------------------------------
+
+function tipoDe(v) {
+  if (v === null) return 'null';
+  if (Array.isArray(v)) return 'array';
+  return typeof v;
+}
+
+function cumpleTipo(v, tipo) {
+  switch (tipo) {
+    case 'object':
+      return tipoDe(v) === 'object';
+    case 'array':
+      return Array.isArray(v);
+    case 'string':
+      return typeof v === 'string';
+    case 'number':
+      return typeof v === 'number' && Number.isFinite(v);
+    case 'integer':
+      return Number.isInteger(v);
+    case 'boolean':
+      return typeof v === 'boolean';
+    case 'null':
+      return v === null;
+    default:
+      return true; // tipo desconocido: se ignora, como las demás palabras clave
+  }
+}
+
+// Subconjunto de RF-03: type, required, properties (recursivo) y enum.
+// `items` y cualquier otra palabra clave se ignoran (C6: los elementos los
+// valida scripts/ruta).
+function validar(v, schema, donde) {
+  if (!schema || typeof schema !== 'object') return null;
+  if (typeof schema.type === 'string' && !cumpleTipo(v, schema.type)) {
+    return `${donde}: se esperaba ${schema.type}, vino ${tipoDe(v)}`;
+  }
+  if (Array.isArray(schema.enum)) {
+    const s = JSON.stringify(v);
+    if (!schema.enum.some((e) => JSON.stringify(e) === s)) return `${donde}: fuera de enum`;
+  }
+  if (tipoDe(v) === 'object') {
+    if (Array.isArray(schema.required)) {
+      for (const k of schema.required) {
+        if (!Object.prototype.hasOwnProperty.call(v, k)) return `${donde}: falta '${k}'`;
+      }
+    }
+    if (schema.properties && typeof schema.properties === 'object') {
+      for (const k of Object.keys(schema.properties)) {
+        if (Object.prototype.hasOwnProperty.call(v, k)) {
+          const err = validar(v[k], schema.properties[k], `${donde}.${k}`);
+          if (err) return err;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function leerArchivo(p, que) {
+  try {
+    return fs.readFileSync(path.resolve(process.cwd(), p), 'utf8');
+  } catch (e) {
+    fallar(2, `falta ${que} ${p}`);
+  }
+}
+
+async function cmdPedir(argv) {
+  const flags = parseFlags(argv, ['--agente', '--prompt-file', '--schema', '--model', '--url'], []);
+  if (!flags['--agente'] || !flags['--prompt-file'] || !flags['--schema']) {
+    fallar(2, `pedir requiere --agente, --prompt-file y --schema\n${USO}`);
+  }
+  const cfg = cargarConfig();
+  const agentes = seccion(cfg, 'agentes') || {};
+  const agente = flags['--agente'];
+  if (!Object.prototype.hasOwnProperty.call(agentes, agente)) fallar(2, `agente desconocido '${agente}'`);
+  if (agente !== 'ollama') fallar(2, `pedir sólo admite ollama en esta versión, no '${agente}'`);
+  const meta = agentes[agente];
+  const model = flags['--model'] !== undefined ? flags['--model'] : meta.model;
+  const url = flags['--url'] !== undefined ? flags['--url'] : meta.url;
+  if (typeof model !== 'string' || model === '') fallar(2, `agentes.${agente}: falta model`);
+  if (typeof url !== 'string' || url === '') fallar(2, `agentes.${agente}: falta url`);
+  const prompt = leerArchivo(flags['--prompt-file'], 'el prompt');
+  let schema;
+  try {
+    schema = JSON.parse(leerArchivo(flags['--schema'], 'el schema'));
+  } catch (e) {
+    if (e instanceof Salida) throw e;
+    fallar(2, `el schema ${flags['--schema']} no es JSON`);
+  }
+
+  const body = JSON.stringify({
+    model,
+    messages: [{ role: 'user', content: prompt }],
+    format: schema,
+    stream: false,
+    options: { temperature: 0 },
+  });
+  const inicio = Date.now();
+  let res;
+  let texto;
+  try {
+    res = await fetch(`${url.replace(/\/+$/, '')}/api/chat`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+      signal: AbortSignal.timeout(PEDIR_TIMEOUT_MS),
+    });
+    texto = await res.text();
+  } catch (e) {
+    const motivo = e && (e.name === 'TimeoutError' || e.name === 'AbortError')
+      ? `timeout de ${PEDIR_TIMEOUT_MS / 1000} s`
+      : `error de red (${(e && e.cause && e.cause.code) || (e && e.message) || e})`;
+    fallar(3, `pedir: ${url}: ${motivo}`);
+  }
+  if (!res.ok) fallar(3, `pedir: ${url}/api/chat respondió HTTP ${res.status}`);
+  const ms = Date.now() - inicio;
+
+  let sobre;
+  try {
+    sobre = JSON.parse(texto);
+  } catch (e) {
+    fallar(4, 'pedir: la respuesta HTTP no es JSON');
+  }
+  const contenido = sobre && sobre.message && sobre.message.content;
+  if (typeof contenido !== 'string') fallar(4, 'pedir: la respuesta no trae message.content');
+  let respuesta;
+  try {
+    respuesta = JSON.parse(contenido);
+  } catch (e) {
+    fallar(4, 'pedir: message.content no es JSON');
+  }
+  const err = validar(respuesta, schema, 'respuesta');
+  if (err) fallar(4, `pedir: no cumple el schema: ${err}`);
+  process.stdout.write(`${JSON.stringify({ agente, model, respuesta, ms })}\n`);
+  return 0;
+}
+
+// --- lint (RF-05, C4) ----------------------------------------------------
+
+function cmdLint(argv) {
+  if (argv.length > 0) fallar(2, `--lint no lleva argumentos\n${USO}`);
+  const cfg = cargarConfig();
+  const agentes = seccion(cfg, 'agentes');
+  const lineas = [];
+  let fallo = false;
+  if (!agentes || Object.keys(agentes).length === 0) {
+    lineas.push('[FAIL] agentes: falta la sección agentes');
+    fallo = true;
+  } else {
+    for (const a of Object.keys(agentes)) {
+      const m = agentes[a];
+      const fails = [];
+      const cmd = typeof m.cmd === 'string' ? m.cmd : '';
+      const cmdBajo = cmd.toLowerCase();
+      for (const f of FLAGS_PROHIBIDAS) {
+        if (cmdBajo.includes(f)) fails.push(f);
+      }
+      if (typeof m.model !== 'string' || m.model === '') fails.push('falta model');
+      const tieneBin = typeof m.bin === 'string' && m.bin !== '';
+      const tieneUrl = typeof m.url === 'string' && m.url !== '';
+      if (!tieneBin && !tieneUrl) fails.push('falta bin o url');
+      if (typeof m.tools !== 'boolean') fails.push('falta tools');
+      if (a !== 'claude' && m.tools === true) {
+        if (cmd === '') {
+          fails.push('falta cmd');
+        } else {
+          for (const marca of ['{bin}', '{model}', '{prompt_file}']) {
+            if (!cmd.includes(marca)) fails.push(`falta ${marca}`);
+          }
+        }
+      }
+      if (fails.length === 0) {
+        lineas.push(`[PASS] agentes: ${a}`);
+      } else {
+        fallo = true;
+        for (const f of fails) lineas.push(`[FAIL] agentes: ${a}: ${f}`);
+      }
+    }
+  }
+  process.stdout.write(lineas.map((l) => `${l}\n`).join(''));
+  return fallo ? 2 : 0;
+}
+
+// --- main ----------------------------------------------------------------
+
+async function main(argv) {
+  const [sub, ...resto] = argv;
+  switch (sub) {
+    case 'generar':
+      return cmdGenerar(resto);
+    case 'prompt':
+      return cmdPrompt(resto);
+    case 'pedir':
+      return cmdPedir(resto);
+    case '--lint':
+      return cmdLint(resto);
+    case '-h':
+    case '--help':
+      process.stdout.write(USO);
+      return 0;
+    default:
+      process.stderr.write(USO);
+      return 2;
+  }
+}
+
+if (require.main === module) {
+  // process.exitCode en vez de process.exit: en macOS stdout a un pipe es
+  // asíncrono y un exit inmediato puede cortar el prompt (y su sha).
+  main(process.argv.slice(2)).then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (e) => {
+      if (e instanceof Salida) {
+        if (e.message) process.stderr.write(`agentes: ${e.message}\n`);
+        process.exitCode = e.code;
+      } else {
+        process.stderr.write(`agentes: error inesperado: ${(e && e.stack) || e}\n`);
+        process.exitCode = 1;
+      }
+    },
+  );
+}
+
+module.exports = { parseYaml, cargarConfig, configPath, validar, REPO_ROOT };

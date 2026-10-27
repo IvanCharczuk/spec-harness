@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# RF-01..RF-04 de spec 0002 (not in this snapshot) (implementa RF-05/06/07/24 de specs/0001).
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/routing.sh
+source "$SELF_DIR/lib/routing.sh"
+cd "$REPO_ROOT"
+
+usage() {
+  cat >&2 <<'EOF'
+uso:
+  scripts/route --spec <id|path> [--routing-config <path>]
+  scripts/route --spec <id|path> --force <A|B> --reason "<texto>" [--routing-config <path>]
+  scripts/route --stats [--sessions <path>] [--specs-dir <path>]
+EOF
+}
+
+MODE=score
+SPEC_ARG=""
+FORCE_TIER=""
+REASON=""
+ROUTING_CONFIG="$REPO_ROOT/config/routing.yaml"
+SESSIONS_PATH="$REPO_ROOT/sessions/index.jsonl"
+SPECS_DIR="$REPO_ROOT/specs"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --spec) SPEC_ARG="${2:-}"; shift 2 ;;
+    --force) FORCE_TIER="${2:-}"; shift 2 ;;
+    --reason) REASON="${2:-}"; shift 2 ;;
+    --stats) MODE=stats; shift ;;
+    --routing-config) ROUTING_CONFIG="${2:-}"; shift 2 ;;
+    --sessions) SESSIONS_PATH="${2:-}"; shift 2 ;;
+    --specs-dir) SPECS_DIR="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "route: argumento desconocido: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+if [ "$MODE" = "stats" ]; then
+  run_stats "$SESSIONS_PATH" "$SPECS_DIR"
+  exit 0
+fi
+
+if [ -z "$SPEC_ARG" ]; then
+  echo "route: falta --spec" >&2
+  usage
+  exit 1
+fi
+
+if ! SPEC_FILE="$(resolve_spec "$SPEC_ARG")" || [ ! -f "$SPEC_FILE" ]; then
+  echo "route: no se pudo resolver spec '$SPEC_ARG'" >&2
+  exit 1
+fi
+
+SPEC_ID="$(basename "$SPEC_FILE" | grep -oE '^[0-9]{4}' || true)"
+[ -z "$SPEC_ID" ] && SPEC_ID="$(basename "$SPEC_FILE" .md)"
+
+# --force (RF-03) -------------------------------------------------------------
+if [ -n "$FORCE_TIER" ]; then
+  if [ -z "$REASON" ]; then
+    echo "route: --force requiere --reason no vacío" >&2
+    exit 1
+  fi
+  case "$FORCE_TIER" in
+    A|B) ;;
+    *) echo "route: --force debe ser A o B" >&2; exit 1 ;;
+  esac
+  apply_force "$SPEC_FILE" "$FORCE_TIER" "$REASON"
+  printf 'SPEC=%s TIER=%s SCORE=- RULE=manual-override\n' "$SPEC_ID" "$FORCE_TIER"
+  exit 0
+fi
+
+# 1) hard_exclusions (RF-01.2) -------------------------------------------------
+if match="$(hard_exclusions_match "$SPEC_FILE" "$ROUTING_CONFIG")"; then
+  src="${match%%$'\t'*}"
+  pat="${match#*$'\t'}"
+  printf 'SPEC=%s BLOQUEO=hard_exclusions MATCH="%s" SOURCE=%s\n' "$SPEC_ID" "$pat" "$src"
+  exit 2
+fi
+
+# 2) señales — siempre se calculan, incluso si termina decidiendo un disparador duro
+read -r score s1 s2 s3 s4 s5 < <(compute_score "$SPEC_FILE" "$ROUTING_CONFIG")
+
+# 3) disparadores duros (RF-01.3), si no hay -> decide por score (RF-01.4)
+rule="$(hard_trigger_rule "$SPEC_FILE")"
+if [ -n "$rule" ]; then
+  tier=B
+else
+  read -r tier rule < <(decide_from_score "$score" "$ROUTING_CONFIG")
+fi
+
+printf 'SPEC=%s TIER=%s SCORE=%s RULE=%s SIGNALS=S1:%s,S2:%s,S3:%s,S4:%s,S5:%s\n' \
+  "$SPEC_ID" "$tier" "$score" "$rule" "$s1" "$s2" "$s3" "$s4" "$s5"
+exit 0

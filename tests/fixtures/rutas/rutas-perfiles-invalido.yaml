@@ -1,0 +1,51 @@
+# Mapeo modo de trabajo -> workflows guardados (RF-04 de specs/0021).
+# Lo lee scripts/rutas; nunca hardcodeado en el script. Cada entrada es una
+# ruta relativa a la raiz del repo; el orden de la lista es el orden en que
+# el agente de la sesion corre los workflows con la herramienta Workflow.
+# Entre los dos de `exhaustivo` va la aprobacion del plan por el operador
+# (RF-03 / D2 de 0021).
+
+directo:
+  - .claude/workflows/ruta-directo.js
+
+exhaustivo:
+  - .claude/workflows/ruta-exhaustivo-plan.js
+  - .claude/workflows/ruta-exhaustivo-impl.js
+
+rutinas:
+  - .claude/workflows/rutina-salud-repo.js
+
+# Perfiles de agente por score (RF-01 de specs/0023). Bandas sobre SCORE de
+# scripts/route, independientes de config/routing.yaml. `scripts/rutas
+# perfiles` y `--lint` leen esta sección; nada de esto se hardcodea en
+# scripts/rutas (RNF-03 de 0023). `fable` e `inherit` no figuran en
+# modelos_validos: ningún subagente hereda el modelo de la sesión (RNF-06).
+perfiles:
+  modelos_validos: [haiku, sonnet, opus]
+  esfuerzos_validos: [low, medium, high, xhigh, max]
+  bandas:
+    directo:
+      panel:         { planificadores: 1, refutadores_por_plan: 1 }
+      planificador:  { model: sonnet, effort: medium }
+      implementador: { model: sonnet, effort: medium }
+      verificador:   { model: haiku,  effort: low }
+      refutador:     { model: haiku,  effort: low }
+      sintesis:      { model: opus,    effort: medium }
+    exhaustivo:
+      # DEFECTO (fixture invalido de CA-02 de specs/0023): falta el rol
+      # `refutador` de esta banda, a proposito, para que --lint y
+      # `scripts/rutas perfiles` lo reporten.
+      panel:         { planificadores: 2, refutadores_por_plan: 2 }
+      planificador:  { model: sonnet, effort: high }
+      implementador: { model: sonnet, effort: high }
+      verificador:   { model: haiku,  effort: low }
+      sintesis:      { model: opus,    effort: high }
+    exhaustivo-critico:  # score > 90, o schema_change / arch_decision en true
+      panel:         { planificadores: 3, refutadores_por_plan: 3 }
+      planificador:  { model: opus,    effort: high }
+      implementador: { model: opus,    effort: high }
+      # DEFECTO (fixture invalido de CA-02 de specs/0023): `model: inherit`
+      # no esta en modelos_validos a proposito.
+      verificador:   { model: inherit, effort: low }
+      refutador:     { model: sonnet, effort: medium }
+      sintesis:      { model: opus,    effort: xhigh }

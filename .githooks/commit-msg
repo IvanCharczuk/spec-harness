@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# RF-10.1 de specs/0001-repo-maestro.md.
+# Implementado por spec 0009 (not in this snapshot).
+set -euo pipefail
+
+MSG_FILE="${1:-}"
+if [ -z "$MSG_FILE" ] || [ ! -f "$MSG_FILE" ]; then
+  echo "commit-msg: no se recibió el archivo de mensaje" >&2
+  exit 1
+fi
+
+# REPO_ROOT se resuelve por la ubicación del propio archivo
+# (BASH_SOURCE), no vía "git rev-parse --show-toplevel" — mismo motivo
+# que pre-commit (RF-04 de 0009): un test que invoque este hook desde
+# un repo git descartable tiene que seguir encontrando
+# scripts/lib/common.sh real.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/common.sh
+source "$SELF_DIR/scripts/lib/common.sh"
+
+# RF-03: ¿algún archivo staged necesita trailer? Mismo staged set que
+# pre-commit ve — en este punto el índice todavía no cambió.
+needs_trailer=0
+while IFS= read -r f; do
+  [ -z "$f" ] && continue
+  is_code_or_config_path "$f" && needs_trailer=1
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ "$needs_trailer" -eq 0 ]; then
+  exit 0
+fi
+
+# "|| true" en cada extracción: grep -m1 sale con exit 1 cuando el
+# trailer buscado está legítimamente ausente (caso esperado, no un
+# error) — bajo "pipefail", eso abortaría el script entero acá mismo
+# vía set -e, antes de llegar a la lógica de abajo que decide el
+# mensaje de rechazo correcto. Mismo bug ya encontrado y corregido en
+# signal_s2 de scripts/lib/routing.sh (D9 de spec 0004 (not in this snapshot)).
+spec_id="$(grep -m1 '^Spec-Id:' "$MSG_FILE" | sed 's/^Spec-Id:[[:space:]]*//' | tr -d '[:space:]' || true)"
+spec_version="$(grep -m1 '^Spec-Version:' "$MSG_FILE" | sed 's/^Spec-Version:[[:space:]]*//' | tr -d '[:space:]' || true)"
+
+# RF-06: override "Spec-Id: none" — exige "Spec-Id-Reason:" no vacío,
+# mismo principio de fricción no-nula que --force/--reason en
+# scripts/route/scripts/session. Sin restricción por archivo tocado:
+# la justificación es la salvaguarda, no una lista de paths permitidos.
+if [ "$spec_id" = "none" ]; then
+  reason_raw="$(grep -m1 '^Spec-Id-Reason:' "$MSG_FILE" | sed 's/^Spec-Id-Reason:[[:space:]]*//' || true)"
+  reason_trimmed="$(printf '%s' "$reason_raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  if [ -z "$reason_trimmed" ]; then
+    echo "commit-msg: 'Spec-Id: none' requiere un trailer 'Spec-Id-Reason:' no vacío" >&2
+    exit 1
+  fi
+  exit 0
+fi
+
+# RF-05: trailers exigidos.
+if [ -z "$spec_id" ]; then
+  echo "commit-msg: este commit toca código/config y no tiene trailer 'Spec-Id:'" >&2
+  exit 1
+fi
+
+if [ -z "$spec_version" ]; then
+  echo "commit-msg: falta el trailer 'Spec-Version:'" >&2
+  exit 1
+fi
+
+if ! ls "$REPO_ROOT"/specs/"$spec_id"-*.md >/dev/null 2>&1; then
+  echo "commit-msg: Spec-Id '$spec_id' no existe en specs/" >&2
+  exit 1
+fi
+
+exit 0

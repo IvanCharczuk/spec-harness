@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# RF-02, RF-03, RF-08, RF-10.3 de specs/0001-repo-maestro.md.
+# Implementado por spec 0003 (not in this snapshot).
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/routing.sh
+source "$SELF_DIR/lib/routing.sh"
+# shellcheck source=lib/worktree.sh
+source "$SELF_DIR/lib/worktree.sh"
+cd "$REPO_ROOT"
+
+usage() {
+  cat >&2 <<'EOF'
+uso:
+  scripts/spec new "<título>" [--id <NNNN>] [--target-branch <rama>|--target-branch-actual]
+  scripts/spec lint <id|ruta>
+  scripts/spec {approve|start|verify|archive|reopen} <id|ruta>
+  scripts/spec trace <id|ruta> [--write] [--target <ruta>]
+EOF
+}
+
+spec_id_of() {
+  local file="$1" id
+  id="$(basename "$file" | grep -oE '^[0-9]{4}' || true)"
+  if [ -n "$id" ]; then printf '%s' "$id"; else basename "$file" .md; fi
+}
+
+resolve_or_die() {
+  local arg="$1" file
+  if ! file="$(resolve_spec "$arg")" || [ ! -f "$file" ]; then
+    echo "spec: no se pudo resolver spec '$arg'" >&2
+    exit 2
+  fi
+  printf '%s' "$file"
+}
+
+# --- new (RF-02 madre) -------------------------------------------------------
+
+cmd_new() {
+  local title="${1:-}"
+  [ -n "$title" ] || { echo "spec: new requiere un título no vacío" >&2; exit 1; }
+  shift || true
+
+  local custom_id="" target_branch="" target_branch_set=0 target_branch_actual=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) custom_id="${2:-}"; shift 2 ;;
+      --target-branch) target_branch="${2:-}"; target_branch_set=1; shift 2 ;;
+      --target-branch-actual) target_branch_actual=1; shift ;;
+      *) echo "spec: new: argumento desconocido: $1" >&2; exit 2 ;;
+    esac
+  done
+
+  # RF-01 de specs/0039: --target-branch-actual toma la rama actual del
+  # cwd (git branch --show-current). Sale 2 si viene junto con
+  # --target-branch (por presencia del flag, sea cual sea su valor), si
+  # HEAD está desacoplado (salida vacía) o si la rama es 'main'.
+  if [ "$target_branch_actual" -eq 1 ]; then
+    if [ "$target_branch_set" -eq 1 ]; then
+      echo "spec: new: --target-branch-actual no se puede combinar con --target-branch" >&2
+      exit 2
+    fi
+    local current_branch
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+    if [ -z "$current_branch" ]; then
+      echo "spec: new: --target-branch-actual requiere una rama actual (HEAD desacoplado)" >&2
+      exit 2
+    fi
+    if [ "$current_branch" = "main" ]; then
+      echo "spec: new: --target-branch-actual no puede usarse parado en 'main'" >&2
+      exit 2
+    fi
+    target_branch="$current_branch"
+  fi
+
+  [ -f "$REPO_ROOT/templates/spec.md" ] || { echo "spec: falta templates/spec.md" >&2; exit 1; }
+
+  local next_id
+  if [ -n "$custom_id" ]; then
+    case "$custom_id" in
+      [0-9][0-9][0-9][0-9])
+        ;;
+      *)
+        echo "spec: --id debe ser de exactamente cuatro dígitos: '$custom_id'" >&2
+        exit 1
+        ;;
+    esac
+    if ls "$REPO_ROOT"/specs/"${custom_id}"-*.md >/dev/null 2>&1; then
+      echo "spec: ya existe una spec con id '$custom_id'" >&2
+      exit 1
+    fi
+    next_id="$custom_id"
+  else
+    # RF-04 de specs/0046: el próximo id respeta lo que ya reservaron ramas,
+    # worktrees y sessions/ids-reservados.jsonl (wt_next_id, 0039), no sólo
+    # el máximo de specs/ como antes — así "spec new" corrido en main no
+    # repite un id que otro worktree ya se reservó.
+    next_id="$(wt_next_id)"
+  fi
+
+  local slug
+  slug="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"
+  slug="$(printf '%s' "$slug" | sed -e 's/á/a/g' -e 's/é/e/g' -e 's/í/i/g' -e 's/ó/o/g' -e 's/ú/u/g' -e 's/ñ/n/g' -e 's/ü/u/g')"
+  slug="$(printf '%s' "$slug" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+
+  local dest="$REPO_ROOT/specs/${next_id}-${slug}.md"
+  local today
+  today="$(date +%Y-%m-%d)"
+
+  awk -v id="$next_id" -v title="$title" -v today="$today" -v target_branch="$target_branch" '
+    BEGIN { before_h1=1 }
+    before_h1 && /^## 1\./ { before_h1=0 }
+    before_h1 && /^id:/         { print "id: \"" id "\""; next }
+    before_h1 && /^title:/      { print "title: \"" title "\""; next }
+    before_h1 && /^version:/    { print "version: 1"; next }
+    before_h1 && /^status:/     { print "status: draft"; next }
+    before_h1 && /^created_at:/ { print "created_at: " today; next }
+    before_h1 && /^updated_at:/ { print "updated_at: " today; next }
+    before_h1 && target_branch != "" && /^target_branch:/ { print "target_branch: \"" target_branch "\""; next }
+    { print }
+  ' "$REPO_ROOT/templates/spec.md" > "$dest"
+
+  echo "$dest"
+}
+
+# --- lint (RF-03 madre) ------------------------------------------------------
+
+run_lint() {
+  local file="$1" ok=0
+
+  local n missing_sections=""
+  for n in 1 2 3 4 5 6 7 8; do
+    grep -qE "^## ${n}\." "$file" || missing_sections="$missing_sections $n"
+  done
+  if [ -z "$missing_sections" ]; then
+    print_pass "las 8 secciones obligatorias están presentes"
+  else
+    print_fail "faltan secciones:$missing_sections"
+    ok=1
+  fi
+
+  local k v missing_fields=""
+  for k in id title version status created_at updated_at schema_change arch_decision target_branch loc_estimate tier_locked supersedes; do
+    v="$(fm_field "$file" "$k")"
+    [ -n "$v" ] || missing_fields="$missing_fields $k"
+  done
+  if [ -z "$missing_fields" ]; then
+    print_pass "front-matter completo (12 campos)"
+  else
+    print_fail "front-matter incompleto:$missing_fields"
+    ok=1
+  fi
+
+  local bad_rf bad_rnf
+  bad_rf="$(section_body "$file" 3 | grep -E '^\*\*' | grep -vE '^\*\*RF-[0-9]+' || true)"
+  bad_rnf="$(section_body "$file" 4 | grep -E '^\*\*' | grep -vE '^\*\*RNF-[0-9]+' || true)"
+  if [ -z "$bad_rf" ] && [ -z "$bad_rnf" ]; then
+    print_pass "requerimientos numerados (RF/RNF) en §3/§4"
+  else
+    print_fail "hay requerimientos sin numerar en §3 o §4"
+    ok=1
+  fi
+
+  if section_body "$file" 6 | awk '
+    /^- \*\*CA-[0-9]+\*\*/ {
+      if (in_ca && !(has_check || has_manual)) { bad=1 }
+      in_ca=1; has_check=0; has_manual=0; next
+    }
+    in_ca && /check:/ { has_check=1 }
+    in_ca && /manual:[ \t]*true/ { has_manual=1 }
+    END {
+      if (in_ca && !(has_check || has_manual)) { bad=1 }
+      exit (bad ? 1 : 0)
+    }
+  '; then
+    print_pass "todos los CA tienen check: o manual: true"
+  else
+    print_fail "hay al menos un CA sin check: ni manual: true"
+    ok=1
+  fi
+
+  local status
+  status="$(fm_field "$file" status)"
+  case "$status" in
+    draft|approved|implementing|verified|archived)
+      print_pass "status válido ($status)" ;;
+    *)
+      print_fail "status inválido: '$status'"
+      ok=1 ;;
+  esac
+
+  check_placeholders "$file" || ok=1
+
+  return "$ok"
+}
+
+# Sexto chequeo de lint (RF-01..03 de specs/0038): líneas del template
+# `templates/spec.md` sin editar. La lista de placeholders se deriva del
+# template en cada corrida (no está hardcodeada).
+check_placeholders() {
+  local file="$1" template="$REPO_ROOT/templates/spec.md"
+
+  if [ ! -f "$template" ]; then
+    print_fail "no se encontró templates/spec.md para el chequeo de placeholders"
+    return 1
+  fi
+
+  local placeholders
+  placeholders="$(awk '
+    {
+      line = $0
+      stripped = line
+      while (match(stripped, /`[^`]*`/)) {
+        stripped = substr(stripped, 1, RSTART - 1) substr(stripped, RSTART + RLENGTH)
+      }
+      if (stripped ~ /<[^!][^<>]*>/) print line
+    }
+  ' "$template")"
+
+  if [ -z "$placeholders" ]; then
+    print_pass "sin placeholders del template"
+    return 0
+  fi
+
+  local matches
+  matches="$(grep -nxF -f <(printf '%s\n' "$placeholders") "$file" 2>/dev/null || true)"
+
+  if [ -z "$matches" ]; then
+    print_pass "sin placeholders del template"
+    return 0
+  fi
+
+  local count first_line first_text
+  count="$(printf '%s\n' "$matches" | wc -l | tr -d ' ')"
+  first_line="$(printf '%s\n' "$matches" | head -1 | cut -d: -f1)"
+  first_text="$(printf '%s\n' "$matches" | head -1 | cut -d: -f2-)"
+  print_fail "quedan $count líneas del template sin editar (primera: línea $first_line: $first_text)"
+  return 1
+}
+
+cmd_lint() {
+  local arg="${1:-}" file ok=0
+  [ -n "$arg" ] || { echo "spec: lint requiere <id|ruta>" >&2; exit 2; }
+  file="$(resolve_or_die "$arg")"
+  run_lint "$file" || ok=$?
+  exit "$ok"
+}
+
+# --- transiciones (RF-08 madre) ----------------------------------------------
+
+generic_transition() {
+  local name="$1" arg="${2:-}" file id from to cur
+
+  [ -n "$arg" ] || { echo "spec: $name requiere <id|ruta>" >&2; exit 2; }
+  file="$(resolve_or_die "$arg")"
+  id="$(spec_id_of "$file")"
+
+  case "$name" in
+    approve) from=draft;         to=approved ;;
+    start)   from=approved;      to=implementing ;;
+    verify)  from=implementing;  to=verified ;;
+    archive) from=verified;      to=archived ;;
+    reopen)  from=implementing;  to=draft ;;
+    *) echo "spec: transición desconocida: $name" >&2; exit 2 ;;
+  esac
+
+  cur="$(fm_field "$file" status)"
+  if [ "$cur" != "$from" ]; then
+    echo "spec: transición inválida: '$id' está en '$cur', '$name' requiere '$from'" >&2
+    exit 1
+  fi
+
+  if [ "$name" = "approve" ]; then
+    local lint_ok=0
+    run_lint "$file" >/dev/null || lint_ok=$?
+    if [ "$lint_ok" -ne 0 ]; then
+      echo "spec: approve requiere 'scripts/spec lint' en verde" >&2
+      exit 1
+    fi
+  fi
+
+  if [ "$name" = "verify" ]; then
+    if ! "$REPO_ROOT/scripts/verify" "$file"; then
+      echo "spec: verify requiere 'scripts/verify' en verde" >&2
+      exit 1
+    fi
+  fi
+
+  # RF-01/RF-02 de specs/0070: corrida en rojo de los CA, en el mismo commit.
+  # El exit 1 de verify es lo esperado (CA todavía sin implementar).
+  local rojo_file=""
+  # RF-01 de 0072: si el registro ya existe se conserva (el rojo original ya
+  # está en la historia de git) y no entra al commit.
+  if [ "$name" = "start" ] && [ -f "$REPO_ROOT/sessions/rojo/$id.txt" ]; then
+    echo "spec: sessions/rojo/$id.txt ya existe, se conserva el rojo original" >&2
+  elif [ "$name" = "start" ]; then
+    local rojo_out rojo_tmp
+    rojo_out="$("$REPO_ROOT/scripts/verify" "$file" 2>/dev/null)" || true
+    rojo_file="$REPO_ROOT/sessions/rojo/$id.txt"
+    mkdir -p "$(dirname "$rojo_file")"
+    rojo_tmp="$(mktemp)"
+    { printf '%s\n' "$rojo_out" | grep -oE '^\[(PASS|FAIL)\] CA-[0-9]+' || true; } > "$rojo_tmp"
+    mv "$rojo_tmp" "$rojo_file"
+  fi
+
+  fm_set_field "$file" status "$to"
+  fm_set_field "$file" updated_at "$(date +%Y-%m-%d)"
+  git add "$file"
+  [ -z "$rojo_file" ] || git add "$rojo_file"
+  # RF-03 de 0072: trailers que exige .githooks/commit-msg.
+  local ver
+  ver="$(fm_field "$file" version)"
+  git commit -q -m "spec($id): $from → $to" -m "Spec-Id: $id
+Spec-Version: $ver"
+}
+
+# --- trace (RF-10.3 madre) ---------------------------------------------------
+
+trace_sessions() {
+  local id="$1" sessions="$REPO_ROOT/sessions/index.jsonl"
+  [ -f "$sessions" ] || return 0
+  local line sid
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    sid="$(json_str "$line" spec_id)"
+    if [ "$sid" = "$id" ]; then
+      printf '- %s (%s → %s) tier=%s outcome=%s\n' \
+        "$(json_str "$line" session_id)" \
+        "$(json_str "$line" started_at)" \
+        "$(json_str "$line" ended_at)" \
+        "$(json_str "$line" tier)" \
+        "$(json_str "$line" outcome)"
+    fi
+  done < "$sessions"
+  return 0
+}
+
+trace_commits() {
+  local id="$1"
+  git log --all --grep="^Spec-Id: ${id}\$" --format='- %h %s' 2>/dev/null || true
+}
+
+write_traza() {
+  local dest="$1" status="$2" sessions_out="$3" commits_out="$4" tmp
+  tmp="$(mktemp)"
+  {
+    awk '
+      /^## §Traza/ { print; exit }
+      { print }
+    ' "$dest"
+    echo ""
+    echo "**Estado actual:** $status"
+    echo ""
+    echo "**Sesiones:**"
+    if [ -n "$sessions_out" ]; then printf '%s\n' "$sessions_out"; else echo "- ninguna"; fi
+    echo ""
+    echo "**Commits:**"
+    if [ -n "$commits_out" ]; then printf '%s\n' "$commits_out"; else echo "- ninguno"; fi
+  } > "$tmp"
+  mv "$tmp" "$dest"
+}
+
+cmd_trace() {
+  local arg="${1:-}"
+  shift || true
+  local write=0 target=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --write) write=1; shift ;;
+      --target) target="${2:-}"; shift 2 ;;
+      *) echo "spec: trace: argumento desconocido: $1" >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$arg" ] || { echo "spec: trace requiere <id|ruta>" >&2; exit 2; }
+  local file id status sessions_out commits_out
+  file="$(resolve_or_die "$arg")"
+  id="$(spec_id_of "$file")"
+  status="$(fm_field "$file" status)"
+  sessions_out="$(trace_sessions "$id")"
+  commits_out="$(trace_commits "$id")"
+
+  echo "STATUS: $status"
+  echo ""
+  echo "SESIONES:"
+  if [ -n "$sessions_out" ]; then printf '%s\n' "$sessions_out"; else echo "- ninguna"; fi
+  echo ""
+  echo "COMMITS:"
+  if [ -n "$commits_out" ]; then printf '%s\n' "$commits_out"; else echo "- ninguno"; fi
+
+  if [ "$write" -eq 1 ]; then
+    local dest="${target:-$file}"
+    write_traza "$dest" "$status" "$sessions_out" "$commits_out"
+  fi
+}
+
+# --- dispatch -----------------------------------------------------------------
+
+[ $# -ge 1 ] || { usage; exit 2; }
+SUBCMD="$1"; shift
+
+case "$SUBCMD" in
+  new) cmd_new "$@" ;;
+  lint) cmd_lint "$@" ;;
+  approve|start|verify|archive|reopen) generic_transition "$SUBCMD" "$@" ;;
+  trace) cmd_trace "$@" ;;
+  -h|--help) usage; exit 0 ;;
+  *) echo "spec: subcomando desconocido: $SUBCMD" >&2; usage; exit 2 ;;
+esac

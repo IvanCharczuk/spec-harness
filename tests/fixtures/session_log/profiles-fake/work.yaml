@@ -1,0 +1,15 @@
+# Copia de test de config/profiles/work.yaml para spec 0006 (not in this snapshot).
+# Mismos cambios que personal.yaml: claude_binary -> mock extendido,
+# workspace_root -> repo git descartable dentro de .state/ (gitignored).
+tier: work
+claude_config_dir: ".state/claude/work"
+dsh_home: ".state/dsh/work"
+workspace_root: ".state/test-workspace-session-log"
+web_ui_port: 8844
+escalation_enabled: false
+claude_binary: "tests/fixtures/session_log/fake-claude"
+
+sandbox_backend: null
+plugins: []
+context_files: []
+approval_policy: null

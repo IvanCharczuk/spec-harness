@@ -1,0 +1,14 @@
+# Copia de test de config/profiles/personal.yaml para spec 0004 (not in this snapshot).
+# Único cambio: claude_binary apunta al mock fake-claude en vez del binario real.
+tier: personal
+claude_config_dir: ".state/claude/personal"
+dsh_home: ".state/dsh/personal"
+workspace_root: "."
+web_ui_port: 8843
+escalation_enabled: true
+claude_binary: "tests/fixtures/session/fake-claude"
+
+sandbox_backend: null
+plugins: []
+context_files: []
+approval_policy: null

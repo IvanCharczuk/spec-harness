@@ -1,0 +1,6 @@
+MODO=directo
+SPEC=0028
+AGENTE=codex
+MODEL=gpt-5-codex
+PROMPT_SHA=fed182176e6d501f3fd1426fc5fb07e6466378d7d38accc41794ccf02b817ac3
+CMD=codex exec --model gpt-5-codex --sandbox workspace-write - < <PROMPT_FILE>

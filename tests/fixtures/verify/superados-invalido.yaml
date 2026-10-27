@@ -1,0 +1,6 @@
+# Fixture de tests/fixtures/verify (RF-01/RF-02 de specs/0046). superado_por
+# apunta a un id inexistente en specs/, para probar el rechazo ([AVISO]).
+- spec: "9104"
+  ca: "CA-02"
+  superado_por: "9999"
+  motivo: "invalida a proposito: 9999 no existe en specs/"

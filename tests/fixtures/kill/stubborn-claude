@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Binario mock que ignora SIGTERM a propósito, para forzar el camino de
+# escalada a SIGKILL de scripts/kill (RF-04 de spec 0007 (not in this snapshot)). CA-06.
+trap '' TERM
+sleep 30

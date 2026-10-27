@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# RF-02..RF-06 de spec 0051 (not in this snapshot)
+# Wrapper fino sobre archify (vendor/archify): toma el primer fence ```archify
+# de una spec (o una IR suelta con --json), completa sólo lo que la IR exige
+# y una spec no debería cargar (RF-03), valida y renderiza un HTML
+# autocontenido fuera de git. Nunca escribe en la spec.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/common.sh
+source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/spec.sh
+source "$SELF_DIR/lib/spec.sh"
+
+usage() {
+  cat >&2 <<'EOF'
+uso:
+  scripts/diagrama <id|ruta.md> [--check]
+  scripts/diagrama --json <archivo> [--check]
+EOF
+}
+
+CHECK=0; JSON_FILE=""; ARG=""; JSON_MODE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check) CHECK=1; shift ;;
+    --json)
+      [ -n "${2:-}" ] || { echo "diagrama: --json requiere un archivo" >&2; usage; exit 2; }
+      JSON_MODE=1; JSON_FILE="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "diagrama: opción desconocida: $1" >&2; usage; exit 2 ;;
+    *)
+      [ -z "$ARG" ] || { echo "diagrama: sobra el argumento: $1" >&2; usage; exit 2; }
+      ARG="$1"; shift ;;
+  esac
+done
+if { [ "$JSON_MODE" -eq 1 ] && [ -n "$ARG" ]; } || { [ "$JSON_MODE" -eq 0 ] && [ -z "$ARG" ]; }; then
+  usage; exit 2
+fi
+
+# RF-06: node del PATH, >= 18.
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+case "$NODE_MAJOR" in ''|*[!0-9]*) NODE_MAJOR=0 ;; esac
+[ "$NODE_MAJOR" -ge 18 ] || { echo "diagrama: requiere node >= 18" >&2; exit 2; }
+
+# Rutas relativas contra el cwd de quien llama, antes de moverse.
+abs() { case "$1" in /*) printf '%s\n' "$1" ;; *) printf '%s/%s\n' "$PWD" "$1" ;; esac; }
+OUT_DIR="$(abs "${DIAGRAMA_DIR:-$REPO_ROOT/.state/diagramas}")"
+if [ "$JSON_MODE" -eq 1 ]; then
+  MODE="json"; SRC="$(abs "$JSON_FILE")"; ID="plan"
+else
+  MODE="spec"
+  SRC="$(resolve_spec "$ARG")" || { echo "diagrama: spec no encontrada: $ARG" >&2; exit 2; }
+  SRC="$(abs "$SRC")"
+  base="$(basename "$SRC")"
+  if [[ "$base" =~ ^([0-9]{4}) ]]; then ID="${BASH_REMATCH[1]}"; else ID="${base%.md}"; fi
+fi
+[ -f "$SRC" ] || { echo "diagrama: no existe el archivo: $SRC" >&2; exit 2; }
+cd "$REPO_ROOT"
+
+# --- núcleo node: extrae la IR, completa RF-03 y escribe la copia temporal ---
+IFS= read -r -d '' NODE_SRC <<'NODEEOF' || true
+'use strict';
+const fs = require('fs'), crypto = require('crypto');
+const [mode, src, dst, id] = process.argv.slice(1);
+const die = (m) => { process.stderr.write('diagrama: ' + m + '\n'); process.exit(2); };
+const buf = fs.readFileSync(src);
+let raw, name;
+if (mode === 'json') {
+  raw = buf.toString('utf8');
+  name = 'plan-' + crypto.createHash('sha256').update(buf).digest('hex').slice(0, 8) + '.html';
+} else {
+  const ls = buf.toString('utf8').split('\n').map((l) => l.replace(/\r$/, ''));
+  const a = ls.findIndex((l) => /^```archify[ \t]*$/.test(l));
+  if (a < 0) {
+    if (ls.some((l) => /^```diagrama/.test(l))) die('formato ```diagrama de 0025 congelado por 0051; no se renderiza más');
+    die('no hay fence archify');
+  }
+  let b = a + 1;
+  while (b < ls.length && !/^```[ \t]*$/.test(ls[b])) b++;
+  if (b >= ls.length) die('el fence archify no cierra');
+  raw = ls.slice(a + 1, b).join('\n');
+  name = id + '.html';
+}
+let ir;
+try { ir = JSON.parse(raw); } catch (e) { die('el JSON no parsea: ' + e.message); }
+if (!ir || typeof ir !== 'object' || Array.isArray(ir)) die('la IR no es un objeto JSON');
+if (ir.schema_version === undefined) ir.schema_version = 1;
+if (ir.diagram_type === undefined) ir.diagram_type = 'sequence';
+const t = ir.diagram_type;
+if (typeof t !== 'string' || !/^[a-z]+$/.test(t)) die('diagram_type inválido: ' + JSON.stringify(t));
+if (ir.meta === undefined) ir.meta = {};
+const obj = (x) => x && typeof x === 'object' && !Array.isArray(x);
+if (obj(ir.meta)) {
+  if (ir.meta.output !== undefined && ir.meta.output !== name)
+    process.stderr.write('diagrama: aviso: meta.output ' + JSON.stringify(ir.meta.output) + ' se reemplaza por ' + name + '\n');
+  ir.meta.output = name;
+  if (t === 'sequence' && ir.meta.column_fit === undefined) ir.meta.column_fit = 'spread';
+}
+if (t === 'sequence') {
+  const ms = Array.isArray(ir.messages) ? ir.messages : [];
+  ms.forEach((m, i) => { if (obj(m) && m.y === undefined) m.y = 160 + 32 * i; });
+  const ys = new Map(), dup = new Set();
+  for (const m of ms) if (obj(m) && typeof m.id === 'string') { if (ys.has(m.id)) dup.add(m.id); ys.set(m.id, m.y); }
+  for (const k of ['segments', 'activations']) {
+    for (const s of Array.isArray(ir[k]) ? ir[k] : []) {
+      if (!obj(s)) continue;
+      for (const [anc, f, d] of [['from_msg', 'from', -10], ['to_msg', 'to', 10]]) {
+        if (!(anc in s)) continue;
+        const v = s[anc]; delete s[anc];
+        if (dup.has(v)) die('ancla a mensaje ambiguo: ' + v);
+        if (!ys.has(v)) die('ancla a mensaje inexistente: ' + v);
+        if (typeof s[f] !== 'number') s[f] = ys.get(v) + d;
+      }
+    }
+  }
+}
+fs.writeFileSync(dst, JSON.stringify(ir, null, 2) + '\n');
+process.stdout.write(t + '\t' + name + '\n');
+NODEEOF
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+META="$(node -e "$NODE_SRC" "$MODE" "$SRC" "$TMP/$ID.json" "$ID")" || exit 2
+IFS=$'\t' read -r TIPO NAME <<<"$META"
+cd "$TMP"
+
+archify() {
+  ARCHIFY_UPDATE_CHECK_DISABLED=1 node "$REPO_ROOT/vendor/archify/bin/archify.mjs" "$@"
+}
+
+# RF-04: validate primero; sus diagnósticos van tal cual debajo del motivo.
+if ! DIAG="$(archify validate "$TIPO" "$ID.json" 2>&1)"; then
+  echo "diagrama: archify validate falló" >&2
+  printf '%s\n' "$DIAG" >&2
+  exit 2
+fi
+[ -z "$DIAG" ] || printf '%s\n' "$DIAG" >&2
+if [ "$CHECK" -eq 1 ]; then exit 0; fi
+
+# RF-02/RF-05: render en el temporal y después al destino (stdout de archify a stderr).
+archify render "$TIPO" "$ID.json" "$NAME" >&2 || { echo "diagrama: archify render falló" >&2; exit 2; }
+[ -s "$TMP/$NAME" ] || { echo "diagrama: archify no escribió $NAME" >&2; exit 2; }
+mkdir -p "$OUT_DIR"
+mv -f "$TMP/$NAME" "$OUT_DIR/$NAME"
+echo "DIAGRAMA=$ID HTML=$OUT_DIR/$NAME"

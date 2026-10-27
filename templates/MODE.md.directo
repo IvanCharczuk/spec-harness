@@ -1,0 +1,88 @@
+# MODE.md — modo `directo`
+
+Contrato del modo de trabajo `directo` (RF-04 de `spec 0014 (not in this snapshot)`).
+Lo elige `scripts/rmaestro` cuando `scripts/route` da `TIER=A` (`score <=
+threshold_simple` de `config/routing.yaml`: pocos RF, pocos paths, pocos
+bloqueos, LOC bajo). El contrato común a ambos modos está en `AGENTS.md` —
+leelo primero si no lo hiciste ya. El agente que adopta este modo es el de
+la sesión actual: no hay otra sesión, no hay otra cuenta.
+
+## Primera acción
+
+Leer la spec activa entera (`specs/<id>-*.md`, la que imprimió `rmaestro` en
+`SPEC=`). Si su `status` es `approved`, correr `scripts/spec start <id>`
+(→ `implementing`) antes de tocar código. Si `rmaestro` imprimió un bloque
+"Carpeta de contexto", leer esos archivos completos también.
+
+## Profundidad de planificación
+
+Un plan corto — lista de pasos, sin rondas de plan-mode — alcanza antes de
+escribir código, salvo que algo puntual de la spec sea genuinamente ambiguo.
+Si durante el trabajo la tarea resulta más compleja de lo que el score
+sugería, eso es señal de reabrir la spec (ver abajo), no de planificar más
+acá.
+
+## Aprobación de comandos destructivos
+
+Nunca auto mode ni bypass de permisos sin supervisión real — ninguna acción
+irreversible (`git push`, `rm`, `git reset --hard`, edición de credenciales o
+hooks) se ejecuta sin confirmación explícita del operador en el momento. En
+este modo podés encadenar operaciones de lectura/reversibles (tests, lectura
+de archivos, `git status`/`diff`) sin pedir confirmación en cada una — pausá
+sólo antes de lo irreversible.
+
+## Verbosidad
+
+Conciso: al terminar, un resumen de qué cambió y por qué, sin narrar cada
+paso intermedio. Si algo salió distinto de lo esperado, decilo — pero no hace
+falta el detalle de cada comando que no aportó nada nuevo.
+
+## Verificaciones
+
+Tras cualquier modificación al repo, antes de darla por hecha: `bash
+scripts/doctor` completo, `scripts/spec lint <id>` de la spec tocada, y
+`scripts/verify <id>` si la spec tiene CA ejecutables — con el desglose por
+CA, nunca un resumen agregado. Antes de commitear, además: fixtures
+compartidos byte a byte iguales a HEAD (`git diff --exit-code -- <fixture>`).
+
+## Si aparece un disparador
+
+Dos categorías, mismo destino:
+
+1. **Disparador duro de RF-05 de `spec 0002 (not in this snapshot)`** (mecánico,
+   verificable por `route`): `schema_change: true`, `arch_decision: true`, o
+   un `target_branch` fuera de `personal/*`, `spec/*`, `sandbox/*` y
+   `<prefijo>/spec-NNNN-*` (rama del IDE de worktrees, 0047), que no estaba marcado al
+   arrancar.
+2. **Bloqueo externo real, descubierto en el momento** (criterio del agente,
+   no del scorer): una dependencia externa genuina que la spec no
+   contemplaba.
+
+En ambos casos: parar; incorporar lo descubierto a la spec (§3/§6/§7);
+bumpear `version` en el front-matter y agregar la entrada `— v<n> —` en
+§Historial con el motivo; volver a correr `scripts/rmaestro <id>`. Si el
+modo resultante es `exhaustivo`, seguir bajo `templates/MODE.md.exhaustivo`
+desde ese punto — misma sesión, mismo agente. No hay otro mecanismo de
+escalado (RF-08 de 0014).
+
+## Ruta agéntica
+
+(RF-06 de `specs/0021-rutas-agenticas-route-elige-un-workflow-de-subagentes-por-modo.md`.)
+Este modo tiene una ruta declarada en el repo: `scripts/rutas directo`
+imprime el workflow a correr (`WORKFLOW=.claude/workflows/ruta-directo.js`).
+Antes de lanzar, `PERFILES=$(scripts/rutas perfiles --spec <id>)` (RF-07 de
+`spec 0023 (not in this snapshot)`)
+y pasalo como `args.perfiles`. Lanzalo con la herramienta `Workflow` pasando
+`args: { spec: "<id>", perfiles: $PERFILES }`: implementa la spec con un
+`implementador`, verifica con un `verificador` y, si algún CA queda en FAIL,
+da una segunda vuelta — máximo 4 agentes. El resultado es el desglose por
+CA; mostráselo al operador tal cual. Al terminar el workflow, correr
+`scripts/rutas log` con los números del bloque de uso (agentes, errores,
+tokens, duración, herramientas), los campos del objeto devuelto (`pasa`,
+`ca_total`, `ca_pass`, `segunda_vuelta`) y `--perfiles "$PERFILES"`;
+mostrarle al operador la línea escrita. Commitear sigue siendo tuyo, con el
+operador, después de las Verificaciones de arriba.
+Si preferís implementar vos mismo sin la ruta, decilo explícitamente: la
+ruta es el camino por defecto, no el único.
+Sin herramienta `Workflow` en esta sesión, o desde terminal: `scripts/ruta
+<modo> <id>` hace lo mismo y registra solo (0030).

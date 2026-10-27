@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# RF-20 de specs/0001-repo-maestro.md.
+# Implementado por spec 0009 (not in this snapshot).
+set -euo pipefail
+
+# REPO_ROOT se resuelve por la ubicación del propio archivo
+# (BASH_SOURCE), no vía "git rev-parse --show-toplevel" (RF-04 de
+# 0009): un test que invoque este hook desde un repo git descartable
+# tiene que seguir encontrando scripts/lib/common.sh real, no el del
+# repo de prueba (que no tiene scripts/lib/). "git diff --cached" sí
+# sigue el CWD normalmente — en producción el CWD es el repo real al
+# momento de commitear; en test, es el repo descartable cuyos archivos
+# staged se quieren inspeccionar.
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/common.sh
+source "$SELF_DIR/scripts/lib/common.sh"
+
+hits="$(git diff --cached --name-only --diff-filter=ACMR | scan_credential_hits)"
+if [ -n "$hits" ]; then
+  echo "pre-commit: posible material credencial en:" >&2
+  echo "$hits" >&2
+  exit 1
+fi
+
+exit 0

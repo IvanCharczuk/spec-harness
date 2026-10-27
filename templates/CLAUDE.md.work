@@ -1,0 +1,60 @@
+# CLAUDE.md — Tier B (work)
+
+Contrato específico de este tier. El contrato común a ambos tiers está en
+`AGENTS.md` — leelo primero si no lo hiciste ya.
+
+**Spec activa:** `specs/${SESSION_SPEC_ID}-*.md`, tier `${SESSION_TIER}`
+(ambas variables las exporta `scripts/session`, RF-04 de
+`spec 0004 (not in this snapshot)` — no hace falta que te las diga el operador).
+
+## Profundidad de planificación
+
+Este tier recibe las specs que el scorer clasificó como complejas
+(`score >= 40` de `config/routing.yaml`, o un escalado manual desde Tier
+A) — RF numerosos, múltiples paths, bloqueos reales, LOC alto. Plan mode
+completo y obligatorio antes de tocar código: enumerá los archivos/CA
+afectados y los casos borde, y mostrale el plan al operador para
+aprobación explícita antes de implementar — no asumas que un plan
+implícito alcanza. Esta cuenta corre bajo la política de una
+organización externa (B-02 de `specs/0001-repo-maestro.md`); más
+deliberación acá cuesta menos que rehacer trabajo bajo esa cuenta.
+
+## Aprobación de comandos destructivos
+
+Nunca auto mode ni bypass de permisos sin supervisión real — mismo
+mínimo que el resto del repo. En este tier la barra es más estricta que
+en personal: confirmá antes de **cualquier** escritura a estado
+compartido, no sólo lo irreversible — `git push` aunque sea a una rama
+de feature, instalar dependencias nuevas, tocar config de CI. Esta
+cuenta opera bajo la política del empleador (B-02), no sólo bajo tu
+propio criterio de reversibilidad.
+
+## Verbosidad del log
+
+Detallado: narrá el razonamiento y las alternativas consideradas antes
+de llegar al enfoque elegido, no sólo el resultado final. La tarea es
+compleja y de mayor riesgo — el operador (y quien revise esto después)
+necesita el rastro completo, no un resumen.
+
+## Sobre escalar
+
+Este tier no escala a ningún otro — es el techo. Señales de reabrir/
+bumpear la spec en este mismo tier — dos categorías distintas:
+
+1. **Disparadores duros de RF-05 de `spec 0002 (not in this snapshot)`** (mecánicos,
+   verificables por `route` sin ambigüedad): `schema_change: true`,
+   `arch_decision: true`, o un `target_branch` que no empiece con
+   `personal/`, `spec/` ni `sandbox/`. Si durante el trabajo notás que
+   cualquiera de estos tres aplica y no estaba marcado al arrancar, es
+   señal automática de detenerse y declarar.
+2. **Bloqueo externo real, descubierto en el momento** (no es uno de
+   los tres disparadores de RF-05 — es criterio del agente, no un
+   mecanismo automático de scoring): si encontrás una dependencia
+   externa genuina que la spec no contemplaba (una API que no existe,
+   un permiso que falta, algo fuera de tu control), también es motivo
+   de parar y declarar — aunque `route` nunca lo detecte por sí solo.
+
+En cualquiera de los dos casos, el disparador de `AGENTS.md` sigue
+aplicando (declarar, no seguir de largo), pero se resuelve reabriendo/
+bumpeando la spec en este mismo tier, no con `scripts/escalate` (que
+sólo cubre A→B, RF-11 madre).

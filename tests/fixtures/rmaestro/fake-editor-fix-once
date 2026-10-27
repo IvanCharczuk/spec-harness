@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Mock de editor para spec 0012 (not in this snapshot) (CA-06): agrega el heading
+# "## 5." faltante la primera vez que se invoca sobre un archivo — simula al
+# operador corrigiendo el defecto real de tests/fixtures/rmaestro/
+# draft-lint-fails.md. Si el heading ya está, no hace nada (idempotente).
+set -euo pipefail
+file="$1"
+if ! grep -qE '^## 5\.' "$file"; then
+  sed -i.bak 's/^Estructura del entregable (sin heading, a propósito)$/## 5. Estructura del entregable/' "$file"
+  rm -f "$file.bak"
+fi

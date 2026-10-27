@@ -1,0 +1,18 @@
+# Copia de test de config/profiles/personal.yaml para spec 0006 (not in this snapshot).
+# Cambios respecto del perfil real: claude_binary apunta al mock fake-claude
+# extendido; workspace_root apunta a un repo git descartable dentro de
+# .state/ (ya excluido por .gitignore, RF-20 madre) para que las CA que
+# ejercitan files_touched (RF-03) commiteen archivos de prueba sin tocar
+# nunca el repo real.
+tier: personal
+claude_config_dir: ".state/claude/personal"
+dsh_home: ".state/dsh/personal"
+workspace_root: ".state/test-workspace-session-log"
+web_ui_port: 8843
+escalation_enabled: true
+claude_binary: "tests/fixtures/session_log/fake-claude"
+
+sandbox_backend: null
+plugins: []
+context_files: []
+approval_policy: null
