@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # RF-17 — Bootstrap idempotente.
-# Valida Node, crea .state/, materializa perfiles, instala hooks, verifica
-# specs/0001-repo-maestro.md e imprime los pasos de login manual pendientes.
-# No escribe credenciales ni ejecuta login (B-08).
+# Valida Node, crea .state/locks, instala hooks y verifica
+# specs/0001-repo-maestro.md. No escribe credenciales ni ejecuta login (B-08).
+# RF-02 de 0096: no crea perfiles, wrappers bin/, estado por tier ni el patch
+# de dsh (ruteo por dos cuentas retirado).
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +27,7 @@ exec_after() {
 echo "== repo-maestro bootstrap =="
 
 # --- 1) Node (RNF-01) --------------------------------------------------------
-echo "[1/9] Node"
+echo "[1/8] Node"
 if ! check_node_range; then
   echo "  ERROR: Node $(node_version_string) fuera de rango soportado (^22.19.0 || >=24.0.0)."
   echo "  dsh no arranca fuera de este rango; bootstrap aborta (RF-17, RNF-01)."
@@ -35,16 +36,12 @@ fi
 echo "  Node $(node_version_string) dentro del rango."
 
 # --- 2) .state/ (RF-14) -------------------------------------------------------
-echo "[2/9] .state/"
-mkdir -p "$REPO_ROOT/.state/claude/personal" \
-         "$REPO_ROOT/.state/claude/work" \
-         "$REPO_ROOT/.state/dsh/personal" \
-         "$REPO_ROOT/.state/dsh/work" \
-         "$REPO_ROOT/.state/locks"
-echo "  .state/{claude,dsh}/{personal,work}, .state/locks listos."
+echo "[2/8] .state/"
+mkdir -p "$REPO_ROOT/.state/locks"
+echo "  .state/locks listo."
 
 # --- 3) .gitignore, README, AGENTS.md ---------------------------------------
-echo "[3/9] archivos de raíz"
+echo "[3/8] archivos de raíz"
 write_if_missing "$REPO_ROOT/.gitignore" <<'EOF'
 .state/
 *.credentials.yaml
@@ -92,19 +89,15 @@ repo, sin importar el tier (RF-16):
    complejidad — no seguir de largo con más alcance del que la spec cubre.
 
 La profundidad de planificación exigida, la política de aprobación de
-comandos destructivos y la verbosidad del log difieren por tier; ver
-`templates/CLAUDE.md.personal` y `templates/CLAUDE.md.work` (RF-16, pendiente).
+comandos destructivos y la verbosidad del log difieren por modo de trabajo;
+ver `templates/MODE.md.*` (RF-04 de spec 0014 (not in this snapshot)).
 EOF
 
 # --- 4) config/ (RNF-04, RF-19, stub de RF-05) ------------------------------
-echo "[4/9] config/"
+echo "[4/8] config/"
 write_if_missing "$REPO_ROOT/config/versions.yaml" <<'EOF'
 # RNF-04 — pin exacto, prohibido rango abierto.
 node_range: "^22.19.0 || >=24.0.0"   # RNF-01, valor firme (definido en la spec)
-
-# [SIN CONFIRMAR] — ver B-05: dsh en developer preview, contrastar contra
-# github.com/deepseek-ai/deepseek-harness antes de fijar versión.
-dsh_version: null
 
 # [SIN CONFIRMAR] — ver B-06 y docs.claude.com antes de fijar versión.
 claude_code_version: null
@@ -115,70 +108,8 @@ write_if_missing "$REPO_ROOT/config/routing.yaml" <<'EOF'
 # Placeholder creado por bootstrap (RF-17) para completar el árbol de §5.1.
 EOF
 
-write_if_missing "$REPO_ROOT/config/plugins.lock.yaml" <<'EOF'
-# Pendiente — ver RF-19 (allowlist de plugins con versión/hash pineado).
-# Placeholder creado por bootstrap (RF-17) para completar el árbol de §5.1.
-plugins: []
-EOF
-
-write_if_missing "$REPO_ROOT/config/profiles/personal.yaml" <<'EOF'
-# config/profiles/personal.yaml — RF-13/§5.2. Rutas relativas a la raíz del repo.
-tier: personal
-claude_config_dir: ".state/claude/personal"
-dsh_home: ".state/dsh/personal"
-workspace_root: "."
-web_ui_port: 8843
-escalation_enabled: true
-claude_binary: "bin/claude-personal"
-
-# Grupo B — placeholder explícito, sin inventar valor definitivo.
-sandbox_backend: null   # [SIN CONFIRMAR] — ver B-05
-plugins: []              # pendiente RF-19
-context_files: []        # pendiente RF-16 (templates/CLAUDE.md.personal)
-approval_policy: null    # [SIN CONFIRMAR] — ver RF-16
-EOF
-
-write_if_missing "$REPO_ROOT/config/profiles/work.yaml" <<'EOF'
-# config/profiles/work.yaml — RF-13/§5.2. Rutas relativas a la raíz del repo.
-tier: work
-claude_config_dir: ".state/claude/work"
-dsh_home: ".state/dsh/work"
-workspace_root: "."
-web_ui_port: 8844
-escalation_enabled: false
-claude_binary: "bin/claude-work"
-
-# Grupo B — placeholder explícito, sin inventar valor definitivo.
-sandbox_backend: null   # [SIN CONFIRMAR] — ver B-05
-plugins: []              # pendiente RF-19
-context_files: []        # pendiente RF-16 (templates/CLAUDE.md.work)
-approval_policy: null    # [SIN CONFIRMAR] — ver RF-16
-EOF
-
-# --- 5) bin/ (RF-15 mínimo) --------------------------------------------------
-echo "[5/9] bin/"
-write_if_missing "$REPO_ROOT/bin/claude-personal" <<'EOF'
-#!/usr/bin/env bash
-# wrapper base RF-15 — delegación completa a dsh pendiente de B-06
-set -euo pipefail
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export CLAUDE_CONFIG_DIR="$SELF_DIR/../.state/claude/personal"
-exec claude "$@"
-EOF
-exec_after "$REPO_ROOT/bin/claude-personal"
-
-write_if_missing "$REPO_ROOT/bin/claude-work" <<'EOF'
-#!/usr/bin/env bash
-# wrapper base RF-15 — delegación completa a dsh pendiente de B-06
-set -euo pipefail
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export CLAUDE_CONFIG_DIR="$SELF_DIR/../.state/claude/work"
-exec claude "$@"
-EOF
-exec_after "$REPO_ROOT/bin/claude-work"
-
-# --- 6) scripts/ stubs (RF-01: árbol completo) ------------------------------
-echo "[6/9] scripts/ (stubs fuera de alcance de esta pasada)"
+# --- 5) scripts/ stubs (RF-01: árbol completo) ------------------------------
+echo "[5/8] scripts/ (stubs fuera de alcance de esta pasada)"
 
 write_stub_script() {
   local name="$1" rfs="$2"
@@ -194,23 +125,12 @@ EOF
 
 write_stub_script "spec" "RF-02, RF-03, RF-08"
 write_stub_script "route" "RF-05, RF-06, RF-07"
-write_stub_script "session" "RF-04, RF-21"
 write_stub_script "verify" "RF-09"
-write_stub_script "escalate" "RF-11"
-write_stub_script "kill" "RF-22"
 
-# --- 7) templates/ y docs/ stubs --------------------------------------------
-echo "[7/9] templates/ y docs/"
+# --- 6) templates/ y docs/ stubs --------------------------------------------
+echo "[6/8] templates/ y docs/"
 write_if_missing "$REPO_ROOT/templates/spec.md" <<'EOF'
 Pendiente — plantilla canónica de spec, ver RF-02.
-Placeholder creado por bootstrap (RF-17) para completar el árbol de §5.1.
-EOF
-write_if_missing "$REPO_ROOT/templates/CLAUDE.md.personal" <<'EOF'
-Pendiente — contrato de agente Tier A, ver RF-16.
-Placeholder creado por bootstrap (RF-17) para completar el árbol de §5.1.
-EOF
-write_if_missing "$REPO_ROOT/templates/CLAUDE.md.work" <<'EOF'
-Pendiente — contrato de agente Tier B, ver RF-16.
 Placeholder creado por bootstrap (RF-17) para completar el árbol de §5.1.
 EOF
 write_if_missing "$REPO_ROOT/docs/spec-lifecycle.md" <<'EOF'
@@ -232,8 +152,8 @@ RF-22. Placeholder creado por bootstrap (RF-17) para completar el árbol de
 §5.1.
 EOF
 
-# --- 8) .githooks/ passthrough + wiring (RF-17 "instala hooks") -------------
-echo "[8/9] .githooks/"
+# --- 7) .githooks/ passthrough + wiring (RF-17 "instala hooks") -------------
+echo "[7/8] .githooks/"
 write_if_missing "$REPO_ROOT/.githooks/pre-commit" <<'EOF'
 #!/usr/bin/env bash
 echo "pre-commit: passthrough — validación real pendiente (RF-20)"
@@ -251,8 +171,8 @@ exec_after "$REPO_ROOT/.githooks/commit-msg"
 git config core.hooksPath .githooks
 echo "  core.hooksPath -> .githooks"
 
-# --- 9) sessions/, specs/archived/, verificación de specs/0001 -------------
-echo "[9/9] sessions/, specs/archived/, specs/0001"
+# --- 8) sessions/, specs/archived/, verificación de specs/0001 -------------
+echo "[8/8] sessions/, specs/archived/, specs/0001"
 mkdir -p "$REPO_ROOT/specs/archived" "$REPO_ROOT/sessions/raw"
 touch "$REPO_ROOT/specs/archived/.gitkeep" "$REPO_ROOT/sessions/raw/.gitkeep"
 [ -f "$REPO_ROOT/sessions/index.jsonl" ] || : > "$REPO_ROOT/sessions/index.jsonl"
@@ -264,27 +184,6 @@ if [ ! -f "$REPO_ROOT/specs/0001-repo-maestro.md" ]; then
 fi
 echo "  specs/0001-repo-maestro.md presente, sin tocar."
 
-# --- 10) cordis.patch.yml ----------------------------------------------------
-# RF-01 de specs/0029: el archivo ya no se versiona (git rm --cached, en
-# .gitignore) porque contiene el path absoluto de ESTE checkout; lo
-# regenera este paso en cada corrida de bootstrap. Si el generador falla
-# (perfil sin resolver, Node fuera de rango para type-stripping), el motivo
-# se imprime y bootstrap sigue con exit 0: el patch sólo importa si se usa
-# dsh, y doctor RF-18.11 pasa informativo cuando el archivo no existe.
-echo "[10] cordis.patch.yml"
-GEN_SCRIPT="$REPO_ROOT/dsh-plugins/dsh-frontend/scripts/generate-cordis-patch.ts"
-if [ -f "$GEN_SCRIPT" ]; then
-  if ! node "$GEN_SCRIPT"; then
-    echo "  generate-cordis-patch falló (ver motivo arriba); bootstrap continúa (0029 RF-01.3)."
-  fi
-else
-  echo "  sin generador, nada que hacer."
-fi
-# --- fin 10) ---
-echo
-echo "== Pendiente — login manual (B-08, bootstrap sólo lo enumera) =="
-echo "  1) CLAUDE_CONFIG_DIR=$REPO_ROOT/.state/claude/personal claude   (Tier A / personal)"
-echo "  2) CLAUDE_CONFIG_DIR=$REPO_ROOT/.state/claude/work claude       (Tier B / work)"
 echo
 echo "bootstrap terminado."
 

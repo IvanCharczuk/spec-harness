@@ -3,7 +3,7 @@
 # RF-05/06/07 de spec 0002 (not in this snapshot). Implementado por
 # spec 0012 (not in this snapshot); paso final redefinido por
 # spec 0014 (not in this snapshot) (route decide un modo de trabajo para la
-# sesión actual — ya no lanza scripts/session). No modifica ninguno de esos
+# sesión actual — ya no lanza una sesión aparte). No modifica ninguno de esos
 # scripts — sólo los invoca como subprocesos completos.
 set -euo pipefail
 
@@ -180,6 +180,16 @@ edit_lint_loop() {
 confirm_and_approve() {
   local file="$1" id="$2" prompt rc=0
 
+  # RF-03 de 0102: con la spec dentro de un worktree vinculado no se
+  # pregunta; aprueba main (v2: una spec fuera del repo sigue preguntando).
+  if spec_en_worktree_vinculado "$file"; then
+    printf "lint está en verde. '%s' queda en draft: la aprueba main con\n" "$id"
+    printf '  scripts/spec approve %s --por-main "<palabras textuales del operador>"\n' "$id"
+    printf 'corrido en %s\n' "$REPO_ROOT"
+    printf 'APROBAR_DESDE_MAIN SPEC=%s RUTA=%s HASH=%s\n' "$id" "$file" "$(git hash-object "$file")"
+    exit 0
+  fi
+
   prompt="$(printf "lint está en verde. ¿Aprobar '%s' (draft → approved, esto commitea)? [s/N] " "$id")"
   if ask_approve "$prompt"; then
     "$REPO_ROOT/scripts/spec" approve "$file" || rc=$?
@@ -272,7 +282,7 @@ else
     approved|implementing)
       route_and_mode "$SPEC_FILE" "$ID"
       ;;
-    verified|archived)
+    verified|archived|superseded|discarded)
       echo "rmaestro: la spec '$ID' ya está en estado '$STATUS'; el flujo de rmaestro no aplica" >&2
       exit 0
       ;;

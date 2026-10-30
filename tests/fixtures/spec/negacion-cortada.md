@@ -1,7 +1,7 @@
-# SPEC — Fixture de prueba (session logging) — verify one-fail
+# SPEC — Fixture de prueba (lint)
 
 **Spec madre:** `specs/0001-repo-maestro.md`. Fixture de test para
-spec 0006 (not in this snapshot), no es una spec real.
+spec 0003 (not in this snapshot), no es una spec real.
 
 **Destinatario:** ninguno — fixture de test.
 
@@ -10,12 +10,12 @@ spec 0006 (not in this snapshot), no es una spec real.
 ---
 
 ```yaml
-id: "9203"
-title: "Fixture de prueba (session logging) — verify one-fail"
+id: "9000"
+title: "Fixture (lint) — negaciones cortadas"
 version: 1
-status: approved
-created_at: 2026-08-25
-updated_at: 2026-08-25
+status: draft
+created_at: 2026-08-21
+updated_at: 2026-08-21
 schema_change: false
 arch_decision: false
 target_branch: "sandbox/fixture"
@@ -28,8 +28,7 @@ supersedes: null
 
 ## 1. Objetivo
 
-Fixture de test: una CA de §6 falla, para probar `verify_result=fail`
-(CA-12 de 0006) incluso cuando el binario del tier sale 0.
+Fixture de test, sin contenido real.
 
 ---
 
@@ -65,10 +64,18 @@ Sin archivos reales.
 
 ## 6. Criterios de aceptación
 
-- **CA-01** — Falla a propósito.
+- **CA-01** — Negaciones bien escritas.
   ```yaml
   check:
-    cmd: "false"
+    cmd: |
+      set -e
+      ! grep -q X /dev/null || exit 1
+      ok=1
+      ! grep -q Y /dev/null || ok=0
+      ! grep -q Z /dev/null; rc=$?
+      ! grep -q W /dev/null && \
+        true
+      ! grep -q V /dev/null
     expect_exit: 0
   ```
 
@@ -88,7 +95,7 @@ Ninguna.
 
 ## §Historial
 
-- 2026-08-25 — v1 — "fixture de test" — Ivan Charczuk
+- 2026-08-21 — v1 — "fixture de test" — Ivan Charczuk
 
 ## §Traza
 

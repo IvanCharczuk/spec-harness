@@ -1,10 +1,7 @@
-# SPEC — Fixture de prueba (escalate) — bumpeada, score da TIER_B
+# SPEC — Fixture de prueba (lint)
 
 **Spec madre:** `specs/0001-repo-maestro.md`. Fixture de test para
-spec 0008 (not in this snapshot), no es una spec real. Simula el caso feliz:
-`version` bumpeada, entrada de §Historial presente, y `schema_change:
-true` (disparador duro de `spec 0002 (not in this snapshot)`) para que `route` dé
-`TIER_B` de forma determinística, sin depender del cálculo de score.
+spec 0003 (not in this snapshot), no es una spec real.
 
 **Destinatario:** ninguno — fixture de test.
 
@@ -13,13 +10,13 @@ true` (disparador duro de `spec 0002 (not in this snapshot)`) para que `route` d
 ---
 
 ```yaml
-id: "9204"
-title: "Fixture de prueba (escalate) — bumpeada, da TIER_B"
-version: 2
-status: approved
-created_at: 2026-08-26
-updated_at: 2026-08-26
-schema_change: true
+id: "9000"
+title: "Fixture (lint) — negación suelta"
+version: 1
+status: draft
+created_at: 2026-08-21
+updated_at: 2026-08-21
+schema_change: false
 arch_decision: false
 target_branch: "sandbox/fixture"
 loc_estimate: 10
@@ -67,10 +64,13 @@ Sin archivos reales.
 
 ## 6. Criterios de aceptación
 
-- **CA-01** — Criterio de prueba.
+- **CA-01** — Negación suelta que no corta.
   ```yaml
   check:
-    cmd: "true"
+    cmd: |
+      set -e
+      ! grep -q X /dev/null
+      true
     expect_exit: 0
   ```
 
@@ -90,8 +90,7 @@ Ninguna.
 
 ## §Historial
 
-- 2026-08-26 — v1 — "fixture de test" — Ivan Charczuk
-- 2026-08-26 — v2 — "bump de prueba, schema_change:true para TIER_B determinístico" — Ivan Charczuk
+- 2026-08-21 — v1 — "fixture de test" — Ivan Charczuk
 
 ## §Traza
 

@@ -9,6 +9,11 @@ export const meta = {
   ],
 }
 
+// Fuente de los args: `args` si trae spec (lanzamiento desde una sesion) o, si
+// no, RUTA_ARGS, la constante que scripts/ruta inserta en el script generado
+// (.state/ruta/, RF-01 de 0088): el prompt headless ya no lleva el plan.
+const ARGS = (args && args.spec) ? args : (typeof RUTA_ARGS !== 'undefined' ? RUTA_ARGS : args)
+
 // Perfiles por agente (modelo + esfuerzo): llegan por args.perfiles, que el
 // agente de la sesion resuelve con `scripts/rutas perfiles --spec <id>`
 // desde config/rutas.yaml (RF-04 de 0023). El PERFILES de aca abajo es el
@@ -21,7 +26,7 @@ const PERFILES = Object.assign({
   verificador: { model: 'haiku', effort: 'low' },
   refutador: { model: 'haiku', effort: 'low' },
   sintesis: { model: 'opus', effort: 'medium' },
-}, (args && args.perfiles) || {})
+}, (ARGS && ARGS.perfiles) || {})
 const perfil = t => {
   const p = Object.assign({}, PERFILES[t] || {})
   // RNF-06 de 0023: ningun subagente hereda el modelo de la sesion (fable, cuota aparte)
@@ -33,8 +38,8 @@ const perfil = t => {
 // que declaran compartir archivos con otro: es caro y el harness lo limpia
 // si no hubo cambios.
 
-const spec = args && args.spec
-const plan = args && args.plan
+const spec = ARGS && ARGS.spec
+const plan = ARGS && ARGS.plan
 if (!spec) throw new Error('ruta-exhaustivo-impl: falta args.spec')
 if (!plan || !Array.isArray(plan.grupos) || !plan.grupos.length) throw new Error('ruta-exhaustivo-impl: falta args.plan.grupos (plan aprobado)')
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # RF-02, RF-03, RF-08, RF-10.3 de specs/0001-repo-maestro.md.
 # Implementado por spec 0003 (not in this snapshot).
+# RF-02 a RF-04 de specs/0001-repo-maestro.md: estados
+# superseded y discarded, campo superseded_by, supersede y discard.
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,6 +12,8 @@ source "$SELF_DIR/lib/common.sh"
 source "$SELF_DIR/lib/routing.sh"
 # shellcheck source=lib/worktree.sh
 source "$SELF_DIR/lib/worktree.sh"
+# shellcheck source=lib/negaciones.sh
+source "$SELF_DIR/lib/negaciones.sh"
 cd "$REPO_ROOT"
 
 usage() {
@@ -17,7 +21,10 @@ usage() {
 uso:
   scripts/spec new "<título>" [--id <NNNN>] [--target-branch <rama>|--target-branch-actual]
   scripts/spec lint <id|ruta>
-  scripts/spec {approve|start|verify|archive|reopen} <id|ruta>
+  scripts/spec {start|verify|archive|reopen} <id|ruta>
+  scripts/spec approve <id|ruta> [--por-main "<palabras textuales>"]
+  scripts/spec supersede <id|ruta> --by <id|ruta>
+  scripts/spec discard <id|ruta>
   scripts/spec trace <id|ruta> [--write] [--target <ruta>]
 EOF
 }
@@ -142,13 +149,15 @@ run_lint() {
     ok=1
   fi
 
+  # RF-05 de specs/0096: `tier_locked` dejó de ser obligatorio. Si está, se
+  # tolera sin validarlo (no se tocan las specs que lo traen).
   local k v missing_fields=""
-  for k in id title version status created_at updated_at schema_change arch_decision target_branch loc_estimate tier_locked supersedes; do
+  for k in id title version status created_at updated_at schema_change arch_decision target_branch loc_estimate supersedes; do
     v="$(fm_field "$file" "$k")"
     [ -n "$v" ] || missing_fields="$missing_fields $k"
   done
   if [ -z "$missing_fields" ]; then
-    print_pass "front-matter completo (12 campos)"
+    print_pass "front-matter completo (11 campos)"
   else
     print_fail "front-matter incompleto:$missing_fields"
     ok=1
@@ -185,16 +194,55 @@ run_lint() {
   local status
   status="$(fm_field "$file" status)"
   case "$status" in
-    draft|approved|implementing|verified|archived)
+    draft|approved|implementing|verified|archived|superseded|discarded)
       print_pass "status válido ($status)" ;;
     *)
       print_fail "status inválido: '$status'"
       ok=1 ;;
   esac
 
+  # RF-02 de specs/0098: una superseded nombra a su sucesora, y existe.
+  if [ "$status" = "superseded" ]; then
+    local sb sb_file
+    sb="$(fm_field "$file" superseded_by)"
+    if [ -z "$sb" ] || [ "$sb" = "null" ]; then
+      print_fail "superseded sin superseded_by"
+      ok=1
+    elif ! sb_file="$(resolve_spec "$sb")" || [ ! -f "$sb_file" ]; then
+      print_fail "superseded_by '$sb' no resuelve a una spec"
+      ok=1
+    else
+      print_pass "superseded_by resuelve ($sb)"
+    fi
+  fi
+
   check_placeholders "$file" || ok=1
+  check_negaciones "$file" "$status" || ok=1
 
   return "$ok"
+}
+
+# Séptimo chequeo de lint (RF-02, RF-03 de specs/0100): negaciones `! cmd`
+# que no son la última línea de un cmd: y no cortan. draft/approved fallan;
+# el resto sólo avisa.
+check_negaciones() {
+  local file="$1" status="$2" casos n ca text rc=0 tag=FAIL
+  casos="$(negaciones_sueltas "$file")"
+  if [ -z "$casos" ]; then
+    print_pass "sin negaciones que no cortan en los check:"
+    return 0
+  fi
+  case "$status" in
+    draft|approved) ;;
+    *) tag=AVISO ;;
+  esac
+  while IFS="$(printf '\t')" read -r n ca text; do
+    printf '[%s] negación que no corta: %s:%s %s %s\n' "$tag" "$file" "$n" "$ca" "$(printf '%s' "$text" | sed 's/^[ \t]*//')"
+    [ "$tag" = FAIL ] && rc=1
+  done <<EOF2
+$casos
+EOF2
+  return "$rc"
 }
 
 # Sexto chequeo de lint (RF-01..03 de specs/0038): líneas del template
@@ -251,10 +299,36 @@ cmd_lint() {
 
 # --- transiciones (RF-08 madre) ----------------------------------------------
 
+# RF-02 de 0102: nombre de la compu según uname -s.
+nombre_compu() {
+  case "$(uname -s)" in
+    Darwin) printf 'notebook' ;;
+    Linux) printf 'PC' ;;
+    *) uname -s ;;
+  esac
+}
+
 generic_transition() {
   local name="$1" arg="${2:-}" file id from to cur
+  local por_main=0 palabras=""
 
   [ -n "$arg" ] || { echo "spec: $name requiere <id|ruta>" >&2; exit 2; }
+  shift 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --por-main)
+        [ "$name" = "approve" ] || { echo "spec: $name: --por-main sólo vale en approve" >&2; exit 2; }
+        [ $# -ge 2 ] || { echo "spec: --por-main requiere palabras" >&2; exit 2; }
+        por_main=1; palabras="$2"; shift 2 ;;
+      *) echo "spec: $name: argumento desconocido: $1" >&2; exit 2 ;;
+    esac
+  done
+  if [ "$por_main" -eq 1 ]; then
+    palabras="$(printf '%s' "$palabras" | tr '\r\n' '  ')"
+    palabras="${palabras#"${palabras%%[![:space:]]*}"}"
+    palabras="${palabras%"${palabras##*[![:space:]]}"}"
+    [ -n "$palabras" ] || { echo "spec: --por-main requiere palabras no vacías" >&2; exit 2; }
+  fi
   file="$(resolve_or_die "$arg")"
   id="$(spec_id_of "$file")"
 
@@ -270,6 +344,11 @@ generic_transition() {
   cur="$(fm_field "$file" status)"
   if [ "$cur" != "$from" ]; then
     echo "spec: transición inválida: '$id' está en '$cur', '$name' requiere '$from'" >&2
+    exit 1
+  fi
+
+  if [ "$name" = "approve" ] && [ "$por_main" -eq 0 ] && spec_en_worktree_vinculado "$file"; then
+    echo "spec: en un worktree vinculado approve requiere --por-main \"<palabras textuales>\" (lo corre main; RF-07 de 0102)" >&2
     exit 1
   fi
 
@@ -306,15 +385,144 @@ generic_transition() {
     mv "$rojo_tmp" "$rojo_file"
   fi
 
+  local backup="" compu="" extra_trailer=""
+  if [ "$por_main" -eq 1 ]; then
+    backup="$(mktemp)"
+    cp "$file" "$backup"
+    compu="$(nombre_compu)"
+    extra_trailer="
+Approved-By: main $compu"
+  fi
   fm_set_field "$file" status "$to"
   fm_set_field "$file" updated_at "$(date +%Y-%m-%d)"
-  git add "$file"
-  [ -z "$rojo_file" ] || git add "$rojo_file"
   # RF-03 de 0072: trailers que exige .githooks/commit-msg.
   local ver
   ver="$(fm_field "$file" version)"
-  git commit -q -m "spec($id): $from → $to" -m "Spec-Id: $id
-Spec-Version: $ver"
+  if [ "$por_main" -eq 1 ]; then
+    local host linea tmp
+    host="$(hostname -s 2>/dev/null || uname -n)"
+    linea="- $(date +%Y-%m-%d) — v${ver} — aprobada desde main (${compu}, ${host}): «${palabras}»"
+    tmp="$(mktemp)"
+    # La línea va antes de las líneas en blanco que preceden a "## §Traza".
+    LINEA="$linea" awk '
+      /^## §Traza/ && !hecho { print ENVIRON["LINEA"]; hecho=1; for (i=1;i<=n;i++) print bl[i]; n=0; print; next }
+      /^[[:space:]]*$/ { bl[++n]=$0; next }
+      { for (i=1;i<=n;i++) print bl[i]; n=0; print }
+      END { for (i=1;i<=n;i++) print bl[i]; if (!hecho) print ENVIRON["LINEA"] }
+    ' "$file" > "$tmp"
+    cat "$tmp" > "$file"; rm -f "$tmp"
+  fi
+  git add "$file"
+  [ -z "$rojo_file" ] || git add "$rojo_file"
+  if ! git commit -q -m "spec($id): $from → $to" -m "Spec-Id: $id
+Spec-Version: $ver${extra_trailer}"; then
+    if [ -n "$backup" ]; then
+      cat "$backup" > "$file"
+      git reset -q -- "$file" 2>/dev/null || true
+      rm -f "$backup"
+    fi
+    exit 1
+  fi
+  [ -z "$backup" ] || rm -f "$backup"
+}
+
+# --- transiciones terminales (RF-03, RF-04 y §8 de specs/0098) ---------------
+
+# Escribe "key: value" en el front-matter: reemplaza la clave si ya existe y,
+# si no, la inserta después de "supersedes:" (o antes del cierre del bloque).
+# fm_set_field sólo reemplaza, por eso este helper; vive acá porque
+# lib/spec.sh no está en §5.1 de 0098.
+fm_upsert_field() {
+  local file="$1" key="$2" value="$3" tmp has
+  has="$(fm_block "$file" | grep -c "^${key}:" || true)"
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" -v has="$has" '
+    BEGIN { infence=0; before_h1=1; done=0 }
+    before_h1 && /^## 1\./ { before_h1=0 }
+    before_h1 && infence && !done && has > 0 && $0 ~ "^"key":" { print key ": " value; done=1; next }
+    before_h1 && infence && !done && has == 0 && /^supersedes:/ { print; print key ": " value; done=1; next }
+    before_h1 && infence && /^```[[:space:]]*$/ {
+      if (!done && has == 0) { print key ": " value; done=1 }
+      infence=0; print; next
+    }
+    before_h1 && !done && /^```yaml[[:space:]]*$/ { infence=1; print; next }
+    { print }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+# Uso: terminal_transition supersede <id|ruta> --by <id|ruta>
+#      terminal_transition discard <id|ruta>
+# Errores de argumentos y resolución: 2; de estado o auto-reemplazo: 1.
+# Nada se escribe hasta pasar todos los controles (§8.1). superseded y
+# discarded son terminales (§8.2): no son origen válido de ninguna transición.
+terminal_transition() {
+  local name="$1"; shift
+  local arg="" by="" by_set=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by)
+        if [ "$name" != "supersede" ]; then
+          echo "spec: $name: argumento desconocido: $1" >&2; exit 2
+        fi
+        [ $# -ge 2 ] || { echo "spec: supersede: --by requiere <id|ruta>" >&2; exit 2; }
+        by="$2"; by_set=1; shift 2 ;;
+      -*) echo "spec: $name: argumento desconocido: $1" >&2; exit 2 ;;
+      *)
+        if [ -n "$arg" ]; then
+          echo "spec: $name: argumento desconocido: $1" >&2; exit 2
+        fi
+        arg="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$arg" ] || { echo "spec: $name requiere <id|ruta>" >&2; exit 2; }
+  if [ "$name" = "supersede" ] && { [ "$by_set" -eq 0 ] || [ -z "$by" ]; }; then
+    echo "spec: supersede requiere --by <id|ruta>" >&2
+    exit 2
+  fi
+
+  local file id
+  file="$(resolve_or_die "$arg")"
+  id="$(spec_id_of "$file")"
+
+  local by_file="" by_id="" to
+  if [ "$name" = "supersede" ]; then
+    to=superseded
+    if ! by_file="$(resolve_spec "$by")" || [ ! -f "$by_file" ]; then
+      echo "spec: supersede: --by '$by' no resuelve a una spec" >&2
+      exit 2
+    fi
+    by_id="$(spec_id_of "$by_file")"
+    if [ "$by_id" = "$id" ]; then
+      echo "spec: supersede: '$id' no puede reemplazarse a sí misma" >&2
+      exit 1
+    fi
+  else
+    to=discarded
+  fi
+
+  local cur ver
+  cur="$(fm_field "$file" status)"
+  case "$name:$cur" in
+    supersede:draft|supersede:approved|supersede:implementing|supersede:verified) ;;
+    discard:draft|discard:approved|discard:implementing) ;;
+    supersede:*)
+      echo "spec: transición inválida: '$id' está en '$cur', 'supersede' requiere draft, approved, implementing o verified" >&2
+      exit 1 ;;
+    *)
+      echo "spec: transición inválida: '$id' está en '$cur', 'discard' requiere draft, approved o implementing" >&2
+      exit 1 ;;
+  esac
+  ver="$(fm_field "$file" version)"
+
+  fm_set_field "$file" status "$to"
+  [ "$name" != "supersede" ] || fm_upsert_field "$file" superseded_by "\"$by_id\""
+  fm_set_field "$file" updated_at "$(date +%Y-%m-%d)"
+  git add "$file"
+  # Con pathspec el commit lleva sólo la spec aunque haya otra cosa en stage.
+  git commit -q -m "spec($id): $cur → $to" -m "Spec-Id: $id
+Spec-Version: $ver" -- "$file"
 }
 
 # --- trace (RF-10.3 madre) ---------------------------------------------------
@@ -405,6 +613,7 @@ case "$SUBCMD" in
   new) cmd_new "$@" ;;
   lint) cmd_lint "$@" ;;
   approve|start|verify|archive|reopen) generic_transition "$SUBCMD" "$@" ;;
+  supersede|discard) terminal_transition "$SUBCMD" "$@" ;;
   trace) cmd_trace "$@" ;;
   -h|--help) usage; exit 0 ;;
   *) echo "spec: subcomando desconocido: $SUBCMD" >&2; usage; exit 2 ;;

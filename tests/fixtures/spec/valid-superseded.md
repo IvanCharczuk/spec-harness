@@ -1,7 +1,7 @@
-# SPEC — Fixture de prueba (session logging) — approved force (TIER=B)
+# SPEC — Fixture de prueba (lint)
 
 **Spec madre:** `specs/0001-repo-maestro.md`. Fixture de test para
-spec 0006 (not in this snapshot), no es una spec real.
+specs/0001-repo-maestro.md, no es una spec real.
 
 **Destinatario:** ninguno — fixture de test.
 
@@ -10,27 +10,26 @@ spec 0006 (not in this snapshot), no es una spec real.
 ---
 
 ```yaml
-id: "9201"
-title: "Fixture de prueba (session logging) — approved force"
+id: "9004"
+title: "Fixture de prueba (lint) — superseded"
 version: 1
-status: approved
-created_at: 2026-08-25
-updated_at: 2026-08-25
+status: superseded
+created_at: 2026-08-21
+updated_at: 2026-08-21
 schema_change: false
-arch_decision: true
+arch_decision: false
 target_branch: "sandbox/fixture"
 loc_estimate: 10
 tier_locked: null
 supersedes: null
+superseded_by: "0098"
 ```
 
 ---
 
 ## 1. Objetivo
 
-Fixture de test: `arch_decision: true` fuerza `TIER=B`, para probar
-`--force` desde el tier `personal` (CA-04) y paralelismo con
-`approved-simple.md` (CA-17).
+Fixture de test, sin contenido real.
 
 ---
 
@@ -89,7 +88,7 @@ Ninguna.
 
 ## §Historial
 
-- 2026-08-25 — v1 — "fixture de test" — Ivan Charczuk
+- 2026-08-21 — v1 — "fixture de test" — Ivan Charczuk
 
 ## §Traza
 

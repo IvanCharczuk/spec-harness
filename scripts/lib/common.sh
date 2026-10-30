@@ -27,7 +27,7 @@ node_version_string() {
   node --version 2>/dev/null || echo "no instalado"
 }
 
-# Extrae "clave: valor" de un YAML plano (sin anidamiento) de config/profiles/*.yaml.
+# Extrae "clave: valor" de un YAML plano (sin anidamiento), p. ej. config/routing.yaml.
 # Uso: yaml_field <archivo> <clave>
 yaml_field() {
   local file="$1" key="$2"
@@ -98,4 +98,20 @@ scan_credential_hits() {
     [ -f "$f" ] || continue
     grep -lE "$cred_patterns" "$f" 2>/dev/null || true
   done
+}
+
+# RF-03/RF-07 de 0102 (v2): ¿la spec vive dentro de un worktree vinculado?
+# Sólo si el checkout de REPO_ROOT es un worktree vinculado y la ruta real
+# del archivo queda bajo él; una spec fuera del repo (mktemp) da falso.
+spec_en_worktree_vinculado() {
+  local file="$1" gd gc root dir
+  gd="$(cd "$REPO_ROOT" && cd "$(git rev-parse --git-dir)" && pwd -P)" || return 1
+  gc="$(cd "$REPO_ROOT" && cd "$(git rev-parse --git-common-dir)" && pwd -P)" || return 1
+  [ "$gd" != "$gc" ] || return 1
+  root="$(cd "$REPO_ROOT" && pwd -P)" || return 1
+  dir="$(cd "$(dirname "$file")" && pwd -P)" || return 1
+  case "$dir/" in
+    "$root"/*) return 0 ;;
+    *) return 1 ;;
+  esac
 }

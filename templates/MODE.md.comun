@@ -1,0 +1,52 @@
+# MODE.md — lo común a los dos modos
+
+Lo leen `templates/MODE.md.directo` y `.exhaustivo` antes que lo propio
+(RF-02 de `spec 0097 (not in this snapshot)`; modos de
+`spec 0014 (not in this snapshot)`). El agente que adopta el modo es el de la
+sesión actual: no hay otra sesión. Rige junto con `AGENTS.md`.
+
+## Primera acción
+
+Leer la spec activa entera (la que imprimió `rmaestro` en `SPEC=`). Si su
+`status` es `approved`, correr `scripts/spec start <id>` (→ `implementing`)
+antes de tocar código. Si `rmaestro` imprimió un bloque "Carpeta de
+contexto", leer esos archivos completos también.
+
+## Verificaciones
+
+Antes de dar por hecha cualquier modificación: `bash scripts/doctor`,
+`scripts/spec lint <id>` y `scripts/verify <id>` si hay CA ejecutables, con
+el desglose por CA, nunca un agregado. Antes de commitear, los fixtures
+compartidos iguales a HEAD (`git diff --exit-code -- <fixture>`). Commitear
+en la rama propia sí; pushear no (`AGENTS.md`, regla 5).
+
+## Si aparece un disparador
+
+1. Disparador duro de RF-05 de `spec 0002 (not in this snapshot)`: `schema_change: true`,
+   `arch_decision: true` o un `target_branch` fuera de `personal/*`,
+   `spec/*`, `sandbox/*` y `<prefijo>/spec-NNNN-*`, que no estaba al arrancar.
+2. Bloqueo externo real descubierto en el momento, que la spec no preveía.
+
+En los dos casos: parar; llevar lo descubierto a la spec (§3/§6/§7); subir
+`version` y agregar `— v<n> —` en §Historial; volver a correr
+`scripts/rmaestro <id>` y seguir bajo el contrato que salga, en esta misma
+sesión. No hay otro mecanismo de escalado (RF-08 de 0014).
+
+## Ruta agéntica
+
+(RF-06 de `specs/0021-rutas-agenticas-route-elige-un-workflow-de-subagentes-por-modo.md`.)
+`scripts/rutas <modo>` imprime los workflows, en orden. Antes de lanzar,
+`PERFILES=$(scripts/rutas perfiles --spec <id>)` y pasarlo como
+`args.perfiles`. Lanzarlos con la herramienta `Workflow`: haber llegado acá
+por `rmaestro` es el opt-in explícito del operador. Si un workflow devuelve
+`plan.diagrama`, guardarlo en un archivo temporal, correr
+`scripts/diagrama --json <tmp>` y mostrar el plan con la ruta del `HTML=`
+(si no valida, mostrar el plan igual con el error). Al terminar cada
+workflow, `scripts/rutas log` con los números del bloque de uso (agentes,
+errores, tokens, duración, herramientas), los campos devueltos (`pasa`,
+`ca_total`, `ca_pass`, `segunda_vuelta`) y `--perfiles "$PERFILES"`, y
+mostrar la línea escrita. Si el operador prefiere que implementes vos sin
+la ruta, lo dice él; no lo asumas.
+
+Sin `Workflow` en la sesión, o desde terminal: `scripts/ruta <modo> <id>
+[--agent <agente>]` hace lo mismo y registra solo (0030; `--agent`, 0086).

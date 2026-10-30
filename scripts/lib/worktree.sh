@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RF-01 de spec 0037 (not in this snapshot);
 # RF-04/RF-05/RF-07 de spec 0039 (not in this snapshot).
-# Funciones compartidas por scripts/tmux-spec y the worktree helper (not in this snapshot) new:
+# Funciones de the worktree helper (not in this snapshot) new (también las usan otros scripts):
 # ninguna tiene efectos al sourcearse (sólo definen funciones). La mayoría
 # sólo lee git y el filesystem; la excepción es wt_reservar (RF-07), que sí
 # escribe: toma un lock atómico con mkdir, agrega una línea a
@@ -156,8 +156,8 @@ wt_branch_slug() {
 # wt_reservar <id> <rama> <titulo>
 #
 # Pensada para correr desde el checkout principal, después de calcular
-# <id> con wt_next_id y antes de crear el worktree nuevo (orca-spec/
-# tmux-spec new). Toma un lock atómico (mkdir en el .git común, compartido
+# <id> con wt_next_id y antes de crear el worktree nuevo (orca-spec
+# new). Toma un lock atómico (mkdir en el .git común, compartido
 # por el checkout principal y todos sus worktrees — D5 de 0039), revalida
 # <id> bajo lock con un wt_next_id fresco (otra sesión pudo reservar en el
 # medio), agrega una línea a sessions/ids-reservados.jsonl en el working

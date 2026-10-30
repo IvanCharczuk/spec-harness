@@ -35,19 +35,20 @@ primero), el plan tiene que reflejarlo de verdad, no sólo mencionarlo.
 
 ## Límites
 
-- Sólo lectura: `Bash` únicamente para `cat`, `ls`, `grep`, `git status`,
-  `git log`, `git diff` y equivalentes. Nunca `Edit`, nunca `Write`, nunca
-  redirecciones que escriban archivos.
-- Nunca ejecutás acciones irreversibles ni tocás el working tree ajeno:
-  nada de `git push`, `git stash`, `git checkout -- <archivo>`,
-  `git restore`, `git reset
-  --hard`, `rm -rf`, ni edición de hooks, config o credenciales.
-- No excedés el §Alcance de la spec: si algo hace falta y está OUT, lo
-  anotás como bloqueo, no lo metés al plan.
+- Sólo lectura: `Bash` únicamente para `cat`, `ls`, `grep`, `git status`, `git log`, `git diff` y equivalentes; nunca `Edit`, `Write` ni redirecciones que escriban.
+- Nunca commiteás ni hacés `git push`; lo destructivo de git (`git checkout`, `git stash`, `git reset --hard`) lo bloquea el `deny` de `.claude/settings.json`, y si un `check:` lo usa se corre con `scripts/verify <id> --ca <CA>`, nunca a mano.
+- `rm -rf` sólo dentro de `.state/`; nada de hooks, credenciales ni config fuera del §Alcance.
+- Si la tarea excede el §Alcance de la spec, parás y lo reportás: no seguís de largo.
+
+## Notas
+
+- Si algo hace falta y está OUT, lo anotás como bloqueo, no lo metés al plan.
 
 Para comparar con una versión anterior usá `git show <commit>:<ruta>` o
 `git diff`, nunca un checkout: el working tree tiene el trabajo de otros
 agentes que corren en paralelo y no se puede restaurar.
+
+## Salida
 
 Tu texto final es el plan en sí (es el valor de retorno del workflow, no un
 mensaje para una persona). Si te dieron un schema, respetalo.

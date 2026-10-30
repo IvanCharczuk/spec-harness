@@ -1,100 +1,42 @@
 # MODE.md — modo `exhaustivo`
 
-Contrato del modo de trabajo `exhaustivo` (RF-04 de
-`spec 0014 (not in this snapshot)`). Lo elige `scripts/rmaestro` cuando
-`scripts/route` da `TIER=B` (`score >= threshold_complex` de
-`config/routing.yaml`, zona intermedia por `default-conservative`, un
-disparador duro, o `--force B`): RF numerosos, múltiples paths, bloqueos
-reales, LOC alto, o una decisión de arquitectura/esquema. El contrato común a
-ambos modos está en `AGENTS.md` — leelo primero si no lo hiciste ya. El
-agente que adopta este modo es el de la sesión actual: no hay otra sesión,
-no hay otra cuenta.
-
-## Primera acción
-
-Leer la spec activa entera (`specs/<id>-*.md`, la que imprimió `rmaestro` en
-`SPEC=`). Si su `status` es `approved`, correr `scripts/spec start <id>`
-(→ `implementing`) antes de tocar código. Si `rmaestro` imprimió un bloque
-"Carpeta de contexto", leer esos archivos completos también.
+Leé primero `templates/MODE.md.comun` (primera acción, verificaciones,
+disparadores y ruta agéntica). Acá va sólo lo propio de este modo. Lo elige
+`scripts/rmaestro` cuando `scripts/route` da `TIER=B` (score alto, zona
+intermedia por `default-conservative`, disparador duro o `--force B`).
 
 ## Profundidad de planificación
 
-Plan explícito y obligatorio antes de tocar código: enumerá los archivos y
-CA afectados, los casos borde y los supuestos que estás haciendo, y
-mostráselo al operador para aprobación explícita antes de implementar — no
-asumas que un plan implícito alcanza. Más deliberación acá cuesta menos que
-rehacer una tarea compleja.
+Plan explícito y obligatorio antes de tocar código: archivos y CA
+afectados, casos borde y supuestos, aprobado por el operador antes de
+implementar. Más deliberación acá cuesta menos que rehacer.
 
 ## Aprobación de comandos destructivos
 
-Nunca auto mode ni bypass de permisos sin supervisión real — mismo mínimo que
-el resto del repo. En este modo la barra es más estricta que en `directo`:
-confirmá antes de **cualquier** escritura a estado compartido, no sólo lo
-irreversible — `git push` aunque sea a una rama de feature, instalar
-dependencias nuevas, tocar config, hooks o cualquier archivo fuera del
-alcance declarado por la spec.
+Confirmá antes de cualquier escritura a estado compartido, no sólo lo
+irreversible: instalar dependencias, tocar config o hooks, o cualquier
+archivo fuera del alcance de la spec.
 
 ## Verbosidad
 
-Detallado: además del resultado, explicá qué alternativas consideraste y por
-qué elegiste el enfoque. La tarea es compleja y de mayor riesgo — el operador
-(y quien revise esto después) necesita poder auditar la decisión.
+Detallado: además del resultado, qué alternativas consideraste y por qué
+elegiste el enfoque, para que se pueda auditar la decisión.
 
-## Verificaciones
+## Disparadores
 
-Tras cualquier modificación al repo, antes de darla por hecha: `bash
-scripts/doctor` completo, `scripts/spec lint <id>` de la spec tocada, y
-`scripts/verify <id>` si la spec tiene CA ejecutables — con el desglose por
-CA, nunca un resumen agregado. Antes de commitear, además: fixtures
-compartidos byte a byte iguales a HEAD (`git diff --exit-code -- <fixture>`).
-
-## Si aparece un disparador
-
-Dos categorías, mismo destino:
-
-1. **Disparador duro de RF-05 de `spec 0002 (not in this snapshot)`** (mecánico,
-   verificable por `route`): `schema_change: true`, `arch_decision: true`, o
-   un `target_branch` fuera de `personal/*`, `spec/*`, `sandbox/*` y
-   `<prefijo>/spec-NNNN-*` (rama del IDE de worktrees, 0047), que no estaba marcado al
-   arrancar.
-2. **Bloqueo externo real, descubierto en el momento** (criterio del agente,
-   no del scorer): una dependencia externa genuina que la spec no
-   contemplaba.
-
-En ambos casos: parar; incorporar lo descubierto a la spec (§3/§6/§7);
-bumpear `version` en el front-matter y agregar la entrada `— v<n> —` en
-§Historial con el motivo; volver a correr `scripts/rmaestro <id>`. Este modo
-es el techo: el resultado va a seguir siendo `exhaustivo` — el bump vale
-igual, porque la spec cambió y tiene que decirlo. No hay otro mecanismo de
-escalado (RF-08 de 0014).
+Este modo es el techo: al volver a correr `rmaestro` sigue siendo
+`exhaustivo`, pero el bump de `version` vale igual.
 
 ## Ruta agéntica
 
-(RF-06 de `specs/0021-rutas-agenticas-route-elige-un-workflow-de-subagentes-por-modo.md`.)
-Este modo tiene una ruta en dos workflows, con el operador en el medio:
-`scripts/rutas exhaustivo` los imprime en orden. Antes de lanzar,
-`PERFILES=$(scripts/rutas perfiles --spec <id>)` (RF-07 de
-`spec 0023 (not in this snapshot)`)
-y pasalo como `args.perfiles` a cada uno.
+`scripts/rutas exhaustivo` imprime dos workflows, con el operador en el
+medio (un workflow no puede pausar). Perfiles con `scripts/rutas perfiles`,
+registro con `scripts/rutas log` y, desde terminal, `scripts/ruta
+exhaustivo <id>`, como dice el común.
 
-1. `ruta-exhaustivo-plan.js` con `args: { spec: "<id>", perfiles: $PERFILES }`:
-   panel de `planificadores` enfoques distintos (según el perfil resuelto,
-   tres por defecto), `refutadores_por_plan` refutadores por plan y una
-   síntesis. Devuelve el plan ganador con los reparos sobrevivientes. No
-   edita nada. Ese plan **es** el plan explícito que exige "Profundidad de
-   planificación": mostráselo al operador y esperá su aprobación.
+1. `ruta-exhaustivo-plan.js` con `args: { spec, perfiles }`: panel de
+   planificadores y refutadores, y síntesis. No edita nada. Su plan es el
+   plan explícito de arriba: mostráselo al operador y esperá su aprobación.
 2. Sólo con el plan aprobado, `ruta-exhaustivo-impl.js` con
-   `args: { spec: "<id>", plan: <el plan aprobado>, perfiles: $PERFILES }`:
-   un `implementador` por grupo del plan, un `verificador` por CA en
-   paralelo y un `refutador` sobre cada CA que pasó. Devuelve el desglose
-   por CA con veredicto.
-
-Al terminar cada workflow, correr `scripts/rutas log` con los números del
-bloque de uso (agentes, errores, tokens, duración, herramientas), los
-campos del objeto devuelto (`pasa`, `ca_total`, `ca_pass`, `segunda_vuelta`)
-y `--perfiles "$PERFILES"`; mostrarle al operador la línea escrita.
-
-Un workflow no puede pausar a esperar al operador; por eso son dos. Las
-Verificaciones de arriba siguen valiendo antes de commitear.
-Sin herramienta `Workflow` en esta sesión, o desde terminal: `scripts/ruta
-<modo> <id>` hace lo mismo y registra solo (0030).
+   `args: { spec, plan, perfiles }`: un `implementador` por grupo, un
+   `verificador` por CA y un `refutador` sobre cada PASS.

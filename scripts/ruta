@@ -29,7 +29,7 @@ uso:
   scripts/ruta <directo|exhaustivo> <spec> [--fase plan|impl] [--plan <json>]
                [--dry-run] [--registro <path>] [--claude <cmd>] [--notas "<texto>"]
                [--config <path>]
-               [--agent <agente>]
+               [--agent <agente>] [--refutador <agente>]
 
   directo:    un solo workflow, sin --fase.
   exhaustivo: --fase plan (default) corre el primer workflow y guarda el
@@ -47,6 +47,13 @@ uso:
               el implementador corre en esa herramienta, scripts/verify
               juzga, hay una sola segunda vuelta si queda algún [FAIL] y se
               registra con --workflow ruta-directo.js. --claude se ignora.
+  --refutador agente de config/agentes.yaml con tools: false (hoy ollama): tras
+              la ruta refuta cada CA en PASS con un comando propio validado
+              por una allowlist (scripts/agentes refutar, RF-06 a RF-08 de
+              specs/0089). Imprime [REFUTADO], [ESCALADO] o [SIN_VEREDICTO] por
+              CA; un [REFUTADO] o un [SIN_VEREDICTO] bajan pasa y ca_pass, un
+              [ESCALADO] no. Vale en directo y en exhaustivo --fase impl, no
+              en --fase plan ni con un agente con herramientas (claude, codex).
 
 exit: 0 ok | 2 uso / modo o flag desconocida / spec inexistente / --fase
   invalida / spec no esta en implementing / headless mal configurado
@@ -56,6 +63,8 @@ exit: 0 ok | 2 uso / modo o flag desconocida / spec inexistente / --fase
   binario/url ausente; 3 si la herramienta falla o se pasa del tope, si
   pedir falla, si un path de la respuesta no está permitido o si el
   agente commiteó (no se revierte nada)
+  con --refutador: 2 también si falta el valor, si el agente es desconocido,
+  tiene tools: true o falta la config, o con exhaustivo --fase plan
 USAGE
 }
 
@@ -83,6 +92,7 @@ REGISTRO="$DEFAULT_REGISTRO"
 CLAUDE_BIN="claude"
 NOTAS_ARG=""
 AGENT=claude
+REFUTADOR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -108,6 +118,9 @@ while [ $# -gt 0 ]; do
     --agent)
       { [ $# -ge 2 ] && [ -n "$2" ]; } || { echo "ruta: --agent requiere un valor" >&2; usage; exit 2; }
       AGENT="$2"; shift 2 ;;
+    --refutador)
+      { [ $# -ge 2 ] && [ -n "$2" ]; } || { echo "ruta: --refutador requiere un valor" >&2; usage; exit 2; }
+      REFUTADOR="$2"; shift 2 ;;
     *) echo "ruta: flag desconocida '$1'" >&2; usage; exit 2 ;;
   esac
 done
@@ -207,6 +220,35 @@ case "$MODE" in
     [ -n "$FASE" ] || FASE="plan"
     ;;
 esac
+
+# RF-08 de specs/0089: guardas de --refutador, todas con exit 2 y sólo si la
+# flag vino. Van después del default de FASE: exhaustivo sin --fase vale plan.
+# Sin la flag este bloque no corre y la config no se lee (RNF-02 de 0086).
+REF_MODEL=""; REF_URL=""
+if [ -n "$REFUTADOR" ]; then
+  [ -f "$AGENTES_CFG" ] || { echo "ruta: falta $AGENTES_CFG" >&2; exit 2; }
+  REF_KNOWN=0
+  while IFS= read -r akey; do
+    [ "$akey" = "$REFUTADOR" ] && REF_KNOWN=1
+  done <<< "$(agentes_keys "$AGENTES_CFG")"
+  if [ "$REF_KNOWN" -ne 1 ]; then
+    echo "ruta: --refutador: agente desconocido '$REFUTADOR'" >&2
+    exit 2
+  fi
+  REF_TOOLS="$(agente_field "$AGENTES_CFG" "$REFUTADOR" tools || true)"
+  if [ "$REF_TOOLS" != "false" ]; then
+    echo "ruta: --refutador '$REFUTADOR' tiene herramientas (o no declara tools: false); sólo refutan los agentes sin ellas" >&2
+    exit 2
+  fi
+  if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "plan" ]; then
+    echo "ruta: --refutador sólo refuta CA (exhaustivo --fase plan no tiene CA que refutar)" >&2
+    exit 2
+  fi
+  REF_MODEL="$(agente_field "$AGENTES_CFG" "$REFUTADOR" model || true)"
+  [ -n "$REF_MODEL" ] || { echo "ruta: falta agentes.$REFUTADOR.model en $AGENTES_CFG" >&2; exit 2; }
+  REF_URL="$(agente_field "$AGENTES_CFG" "$REFUTADOR" url || true)"
+  [ -n "$REF_URL" ] || { echo "ruta: falta agentes.$REFUTADOR.url en $AGENTES_CFG" >&2; exit 2; }
+fi
 
 # Guarda 4 (ultima): estado de la spec. No aplica con --dry-run ni en modo
 # prueba (--claude Y --registro, los dos distintos del default — v2, D10):
@@ -434,6 +476,89 @@ ruta_ext_verify() {
   fi
 }
 
+# --- RF-06 a RF-08 de specs/0089: refutador externo -------------------------
+# Una `scripts/agentes refutar` por CA en PASS, en serie. Nada de esto corre
+# sin --refutador. Cualquier exit != 0 de refutar es [SIN_VEREDICTO] (no sólo
+# 3 y 4): un refutador caído nunca cuenta como "no refutado" (RF-07).
+REF_N_REFUTADOS=0; REF_N_ESCALADOS=0; REF_N_SINVER=0
+REF_L_REFUTADOS=""; REF_L_ESCALADOS=""; REF_L_SINVER=""
+REF_RUTA_SUFFIX=""; REF_NOTAS=""
+
+# Lee el JSON de refutar (stdin) y emite: primera línea REFUTADO|ESCALADO|
+# NADA|INVALIDO, después el texto a imprimir. Todo va sin saltos de línea ni
+# control en la línea de cabecera; la salida del comando, indentada 4 espacios
+# y recortada, para que ninguna línea empiece con `[` ni con `RUTA=`.
+RUTA_REF_FMT_SRC="$(cat <<'NODEEOF'
+'use strict';
+const fs = require('fs');
+const ca = process.argv[1];
+let j;
+try { j = JSON.parse(fs.readFileSync(0, 'utf8').trim()); } catch (e) { j = null; }
+if (!j || typeof j !== 'object') { console.log('INVALIDO\nla salida de refutar no es JSON'); process.exit(0); }
+const one = (v, max) => Array.from(String(v).replace(/[\u0000-\u001f\u007f]+/g, ' ')).slice(0, max).join('');
+const cmd = Array.isArray(j.comando) ? one(j.comando.map((x) => String(x)).join(' '), 200) : '';
+if (j.refutado === true) {
+  const lines = [`[REFUTADO] ${ca} ${cmd} → exit=${j.exit === undefined || j.exit === null ? 'n/a' : j.exit}`];
+  let sal = typeof j.salida === 'string' ? j.salida : '';
+  let cut = false;
+  if (Array.from(sal).length > 1000) { sal = Array.from(sal).slice(0, 1000).join(''); cut = true; }
+  let ls = sal.replace(/\r/g, '').replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ' ').split('\n');
+  while (ls.length && ls[ls.length - 1] === '') ls.pop();
+  if (ls.length > 20) { ls = ls.slice(0, 20); cut = true; }
+  for (const l of ls) lines.push('    ' + Array.from(l).slice(0, 200).join(''));
+  if (cut) lines.push('    ...');
+  console.log('REFUTADO\n' + lines.join('\n'));
+} else if (j.escalado === true) {
+  console.log('ESCALADO\n' + `[ESCALADO] ${ca} ${cmd} → ${one(j.motivo || '', 200)}`);
+} else {
+  console.log('NADA\n');
+}
+NODEEOF
+)"
+
+# ruta_refutador_correr <CA>...: imprime una línea por CA que lo amerita y
+# deja los conteos y listas en REF_*. Siempre devuelve 0.
+ruta_refutador_correr() {
+  local ca rc out res kind body
+  REF_N_REFUTADOS=0; REF_N_ESCALADOS=0; REF_N_SINVER=0
+  REF_L_REFUTADOS=""; REF_L_ESCALADOS=""; REF_L_SINVER=""
+  for ca in "$@"; do
+    [ -n "$ca" ] || continue
+    rc=0
+    out="$(node "$SELF_DIR/agentes" refutar --spec "$SPEC_ID" --ca "$ca" --agente "$REFUTADOR" </dev/null)" || rc=$?
+    kind=""; body=""
+    if [ "$rc" -ne 0 ]; then
+      kind="SINVER"
+      body="[SIN_VEREDICTO] ${ca} → refutar salió con ${rc}"
+    else
+      res="$(printf '%s' "$out" | node -e "$RUTA_REF_FMT_SRC" -- "$ca")" || res="INVALIDO"
+      kind="${res%%$'\n'*}"
+      case "$res" in *$'\n'*) body="${res#*$'\n'}" ;; esac
+      if [ "$kind" = "INVALIDO" ]; then
+        kind="SINVER"
+        body="[SIN_VEREDICTO] ${ca} → ${body:-la salida de refutar no es JSON}"
+      fi
+    fi
+    case "$kind" in
+      REFUTADO)
+        REF_N_REFUTADOS=$(( REF_N_REFUTADOS + 1 ))
+        REF_L_REFUTADOS="${REF_L_REFUTADOS:+$REF_L_REFUTADOS,}$ca"
+        printf '%s\n' "$body" ;;
+      ESCALADO)
+        REF_N_ESCALADOS=$(( REF_N_ESCALADOS + 1 ))
+        REF_L_ESCALADOS="${REF_L_ESCALADOS:+$REF_L_ESCALADOS,}$ca"
+        printf '%s\n' "$body" ;;
+      SINVER)
+        REF_N_SINVER=$(( REF_N_SINVER + 1 ))
+        REF_L_SINVER="${REF_L_SINVER:+$REF_L_SINVER,}$ca"
+        printf '%s\n' "$body" ;;
+    esac
+  done
+  REF_RUTA_SUFFIX=" REFUTADOR=${REFUTADOR} REFUTADOS=${REF_N_REFUTADOS} ESCALADOS=${REF_N_ESCALADOS} SIN_VEREDICTO=${REF_N_SINVER}"
+  REF_NOTAS="refutador=${REFUTADOR} refutados=${REF_L_REFUTADOS} escalados=${REF_L_ESCALADOS} sin_veredicto=${REF_L_SINVER}"
+  return 0
+}
+
 correr_agente_externo() {
   local vf vuelta_pf
   EXT_MODEL="$(agente_field "$AGENTES_CFG" "$AGENT" model)" && [ -n "$EXT_MODEL" ] || ruta_ext_falta model
@@ -480,6 +605,9 @@ correr_agente_externo() {
     printf 'AGENTE=%s\n' "$AGENT"
     printf 'MODEL=%s\n' "$EXT_MODEL"
     printf 'PROMPT_SHA=%s\n' "$sha"
+    if [ -n "$REFUTADOR" ]; then
+      printf 'REFUTADOR=%s MODEL=%s URL=%s\n' "$REFUTADOR" "$REF_MODEL" "$REF_URL"
+    fi
     printf 'CMD=%s\n' "$cmd_line"
     return 0
   fi
@@ -546,12 +674,29 @@ correr_agente_externo() {
   run_id="ruta-${AGENT}-${SPEC_ID}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 
   grep -E '^\[(PASS|FAIL|MANUAL)\] CA-' "$vf" || true
-  printf 'RUTA=%s SPEC=%s WORKFLOW=%s AGENTE=%s MODEL=%s RUN_ID=%s AGENTES=%s TOKENS=0 DURACION_MS=%s PASA=%s CA_PASS=%s/%s SEGUNDA_VUELTA=%s\n' \
-    "$MODE" "$SPEC_ID" "ruta-directo.js" "$AGENT" "$EXT_MODEL" "$run_id" "$n_agentes" "$dur" "$pasa" "$ca_pass" "$ca_total" "$segunda"
+  # RF-06/.07 de 0089: con --refutador, cada [PASS] CA- de verify se refuta
+  # antes de RUTA=; un [REFUTADO] o [SIN_VEREDICTO] bajan pasa y ca_pass.
+  if [ -n "$REFUTADOR" ]; then
+    local ref_cas=() rline
+    while IFS= read -r rline; do
+      [ -n "$rline" ] || continue
+      ref_cas+=("$(printf '%s' "$rline" | awk '{print $2}')")
+    done <<< "$(grep -E '^\[PASS\] CA-' "$vf" || true)"
+    ruta_refutador_correr "${ref_cas[@]:-}"
+    if [ $(( REF_N_REFUTADOS + REF_N_SINVER )) -gt 0 ]; then
+      pasa=false
+      ca_pass=$(( ca_pass - REF_N_REFUTADOS - REF_N_SINVER ))
+    fi
+  fi
+  printf 'RUTA=%s SPEC=%s WORKFLOW=%s AGENTE=%s MODEL=%s RUN_ID=%s AGENTES=%s TOKENS=0 DURACION_MS=%s PASA=%s CA_PASS=%s/%s SEGUNDA_VUELTA=%s%s\n' \
+    "$MODE" "$SPEC_ID" "ruta-directo.js" "$AGENT" "$EXT_MODEL" "$run_id" "$n_agentes" "$dur" "$pasa" "$ca_pass" "$ca_total" "$segunda" "$REF_RUTA_SUFFIX"
 
   # RF-08.4: el prefijo agente=<a> model=<m> va siempre adelante (lo filtra
   # RF-09 de 0086); se recorta a 200 caracteres sin partir multibyte.
   notas="agente=${AGENT} model=${EXT_MODEL}; headless scripts/ruta"
+  # RF-07 de 0089: el segmento del refutador va antes de NOTAS_ARG, así el
+  # recorte a 200 se come el texto del operador y no las listas.
+  [ -z "$REFUTADOR" ] || notas="${notas}; ${REF_NOTAS}"
   [ -z "$NOTAS_ARG" ] || notas="${notas}; ${NOTAS_ARG}"
   notas="$(printf '%s' "$notas" | node -e 'const s=require("fs").readFileSync(0,"utf8");process.stdout.write(Array.from(s).slice(0,200).join(""))')"
 
@@ -616,23 +761,36 @@ if [ "$FASE" = "impl" ]; then
     else if (obj && obj.result && hasGrupos(obj.result.plan)) plan = obj.result.plan;
     else if (hasGrupos(obj)) plan = obj;
     if (!plan) process.exit(1);
-    process.stdout.write(JSON.stringify(plan));
+    // RF-02 de 0088: sólo lo que lee ruta-exhaustivo-impl.js.
+    const rec = {};
+    for (const k of ["grupos", "casos_borde", "supuestos"]) if (plan[k] !== undefined) rec[k] = plan[k];
+    process.stdout.write(JSON.stringify(rec));
   ' "$PLAN_ARG")"; then
     echo "ruta: --plan '$PLAN_ARG' no tiene la forma esperada (falta plan.grupos)" >&2
     exit 2
   fi
 fi
 
-ARGS_JSON="$(node -e '
+# El plan va por stdin: en Linux un solo argumento no puede pasar de 128 KB
+# (MAX_ARG_STRLEN) y un plan exhaustivo llega a 200 KB.
+ARGS_JSON="$(printf '%s' "$PLAN_JSON" | node -e '
   const spec = process.argv[1];
   const perfiles = JSON.parse(process.argv[2]);
-  const planRaw = process.argv[3];
+  const planRaw = require("fs").readFileSync(0, "utf8");
   const out = { spec, perfiles };
   if (planRaw) out.plan = JSON.parse(planRaw);
   process.stdout.write(JSON.stringify(out));
-' "$SPEC_ID" "$PERFILES_JSON" "$PLAN_JSON")"
+' "$SPEC_ID" "$PERFILES_JSON")"
 
-PROMPT="Ejecutá la herramienta Workflow con scriptPath=${WORKFLOW_ABS} y args=${ARGS_JSON}. No uses ninguna otra herramienta ni modifiques el script. Cuando la herramienta termine, respondé sólo: listo."
+# RF-01 de 0088: en exhaustivo --fase impl el workflow se lanza desde una copia
+# generada con los args adentro (const RUTA_ARGS) y sin args en el prompt.
+GEN_REL=""
+if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "impl" ]; then
+  GEN_REL=".state/ruta/${SPEC_ID}-${WORKFLOW_BASENAME}"
+  PROMPT="Ejecutá la herramienta Workflow con scriptPath=${REPO_ROOT}/${GEN_REL}, sin args. No uses ninguna otra herramienta ni modifiques el script. Cuando la herramienta termine, respondé sólo: listo."
+else
+  PROMPT="Ejecutá la herramienta Workflow con scriptPath=${WORKFLOW_ABS} y args=${ARGS_JSON}. No uses ninguna otra herramienta ni modifiques el script. Cuando la herramienta termine, respondé sólo: listo."
+fi
 
 CMD_LINE="CMD=CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=${BG_WAIT_MS} printf '%s' \"\$PROMPT\" | ${CLAUDE_BIN} -p --setting-sources ${SETTING_SOURCES} --strict-mcp-config --model ${SESSION_MODEL} --permission-mode ${PERMISSION_MODE} --allowedTools Workflow --disallowedTools \"Bash(git push *)\" --max-turns ${MAX_TURNS} --output-format stream-json --verbose"
 
@@ -644,9 +802,27 @@ if [ "$DRY_RUN" -eq 1 ]; then
   [ "$MODE" = "exhaustivo" ] && printf 'FASE=%s\n' "$FASE"
   printf 'WORKFLOW=%s\n' "$WORKFLOW_ABS"
   printf 'ARGS=%s\n' "$ARGS_JSON"
+  [ -n "$GEN_REL" ] && printf 'SCRIPT=%s\n' "$GEN_REL"
   printf 'PROMPT=%s\n' "$PROMPT"
+  if [ -n "$REFUTADOR" ]; then
+    printf 'REFUTADOR=%s MODEL=%s URL=%s\n' "$REFUTADOR" "$REF_MODEL" "$REF_URL"
+  fi
   printf '%s\n' "$CMD_LINE"
   exit 0
+fi
+
+if [ -n "$GEN_REL" ]; then
+  mkdir -p "$REPO_ROOT/.state/ruta" 2>/dev/null \
+    && printf '%s' "$ARGS_JSON" | node -e '
+      const fs = require("fs");
+      const src = fs.readFileSync(process.argv[1], "utf8");
+      const m = /^export const meta = \{[\s\S]*?^\}[^\n]*\n/m.exec(src);
+      if (!m) process.exit(1);
+      const end = m.index + m[0].length;
+      const line = "const RUTA_ARGS = " + fs.readFileSync(0, "utf8") + ";\n";
+      fs.writeFileSync(process.argv[2], src.slice(0, end) + line + src.slice(end));
+    ' "$WORKFLOW_ABS" "$REPO_ROOT/$GEN_REL" \
+    || { echo "ruta: no se pudo escribir ${GEN_REL}" >&2; exit 2; }
 fi
 
 # --- RF-03.3/.4: invocacion real, stdout completo a sessions/raw/ ----------
@@ -871,6 +1047,11 @@ if (caArr) {
     const detalle = (c && c.detalle) || '';
     console.log(['CA', clean(id), clean(estado), clean(detalle)].join('\t'));
   }
+  // RF-06 de 0089: los CA que el refutador del workflow ya refutó no se
+  // vuelven a refutar por afuera.
+  for (const c of caArr) {
+    if (c && c.refutado === true) console.log(['CAREF', clean((c && c.id) || '')].join('\t'));
+  }
 }
 process.exit(0);
 NODEEOF
@@ -892,6 +1073,7 @@ fi
 F_RUN_ID=""; F_AGENT_COUNT=""; F_TOTAL_TOKENS=""; F_TOOL_USES=""; F_DURATION_MS=""
 F_PASA=""; F_CA_TOTAL=""; F_CA_PASS=""; F_SEGUNDA_VUELTA=""; F_AGENTES_ERROR=""
 declare -a CA_LINES=()
+declare -a CAREF_IDS=()
 
 while IFS= read -r line; do
   case "$line" in
@@ -909,6 +1091,7 @@ while IFS= read -r line; do
     SEGUNDA_VUELTA=*) F_SEGUNDA_VUELTA="${line#SEGUNDA_VUELTA=}" ;;
     AGENTES_ERROR=*) F_AGENTES_ERROR="${line#AGENTES_ERROR=}" ;;
     CA$'\t'*) CA_LINES+=("$line") ;;
+    CAREF$'\t'*) CAREF_IDS+=("${line#CAREF$'\t'}") ;;
   esac
 done <<< "$NODE_OUT"
 
@@ -1003,6 +1186,31 @@ for line in "${CA_LINES[@]:-}"; do
   esac
 done
 
+# RF-06/.07 de 0089: refutador externo sobre los CA en PASS que el workflow no
+# refutó ya (CAREF). Un [REFUTADO] o [SIN_VEREDICTO] fuerza pasa=false (con
+# F_PASA=null sólo se fuerza false) y descuenta de ca_pass si es entero.
+if [ -n "$REFUTADOR" ]; then
+  declare -a REF_CAS=()
+  for line in "${CA_LINES[@]:-}"; do
+    [ -n "$line" ] || continue
+    IFS=$'\t' read -r _tag ca_id ca_estado _ca_detalle <<< "$line"
+    [ "$ca_estado" = "PASS" ] || continue
+    ya=0
+    for r in "${CAREF_IDS[@]:-}"; do
+      [ "$r" = "$ca_id" ] && ya=1
+    done
+    [ "$ya" -eq 1 ] || REF_CAS+=("$ca_id")
+  done
+  ruta_refutador_correr "${REF_CAS[@]:-}"
+  if [ $(( REF_N_REFUTADOS + REF_N_SINVER )) -gt 0 ]; then
+    F_PASA=false
+    case "$F_CA_PASS" in
+      ''|*[!0-9]*) : ;;
+      *) F_CA_PASS=$(( F_CA_PASS - REF_N_REFUTADOS - REF_N_SINVER )) ;;
+    esac
+  fi
+fi
+
 if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "plan" ]; then
   printf 'RUTA=%s SPEC=%s WORKFLOW=%s RUN_ID=%s AGENTES=%s TOKENS=%s DURACION_MS=%s PASA=n/a PLAN=%s RAW=%s\n' \
     "$MODE" "$SPEC_ID" "$WORKFLOW_BASENAME" "$F_RUN_ID" "$F_AGENT_COUNT" "$F_TOTAL_TOKENS" "$F_DURATION_MS" "$PLAN_JSON_PATH" "$RAW_REL"
@@ -1010,15 +1218,18 @@ if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "plan" ]; then
   printf '%s\n' "$PLAN_MD_PATH"
   printf 'siguiente: scripts/ruta exhaustivo %s --fase impl --plan %s\n' "$SPEC_ID" "$PLAN_JSON_PATH"
 else
-  printf 'RUTA=%s SPEC=%s WORKFLOW=%s RUN_ID=%s AGENTES=%s TOKENS=%s DURACION_MS=%s PASA=%s CA_PASS=%s/%s SEGUNDA_VUELTA=%s RAW=%s\n' \
-    "$MODE" "$SPEC_ID" "$WORKFLOW_BASENAME" "$F_RUN_ID" "$F_AGENT_COUNT" "$F_TOTAL_TOKENS" "$F_DURATION_MS" "$F_PASA" "$F_CA_PASS" "$F_CA_TOTAL" "$F_SEGUNDA_VUELTA" "$RAW_REL"
+  printf 'RUTA=%s SPEC=%s WORKFLOW=%s RUN_ID=%s AGENTES=%s TOKENS=%s DURACION_MS=%s PASA=%s CA_PASS=%s/%s SEGUNDA_VUELTA=%s RAW=%s%s\n' \
+    "$MODE" "$SPEC_ID" "$WORKFLOW_BASENAME" "$F_RUN_ID" "$F_AGENT_COUNT" "$F_TOTAL_TOKENS" "$F_DURATION_MS" "$F_PASA" "$F_CA_PASS" "$F_CA_TOTAL" "$F_SEGUNDA_VUELTA" "$RAW_REL" "$REF_RUTA_SUFFIX"
 fi
 
 # --- RF-06: registro automatico ---------------------------------------------
 
 NOTAS_BASE="headless scripts/ruta"
 FULL_NOTAS="$NOTAS_BASE"
-[ -z "$NOTAS_ARG" ] || FULL_NOTAS="${NOTAS_BASE}; ${NOTAS_ARG}"
+# RF-07 de 0089: el segmento del refutador va antes de NOTAS_ARG, así el
+# recorte a 200 se come el texto del operador y no las listas.
+[ -z "$REFUTADOR" ] || FULL_NOTAS="${FULL_NOTAS}; ${REF_NOTAS}"
+[ -z "$NOTAS_ARG" ] || FULL_NOTAS="${FULL_NOTAS}; ${NOTAS_ARG}"
 FULL_NOTAS="$(printf '%s' "$FULL_NOTAS" | node -e 'const s=require("fs").readFileSync(0,"utf8");process.stdout.write(Array.from(s).slice(0,200).join(""))')"
 
 if [ "$MODE" = "exhaustivo" ] && [ "$FASE" = "plan" ]; then

@@ -41,7 +41,7 @@ spec_version="$(grep -m1 '^Spec-Version:' "$MSG_FILE" | sed 's/^Spec-Version:[[:
 
 # RF-06: override "Spec-Id: none" — exige "Spec-Id-Reason:" no vacío,
 # mismo principio de fricción no-nula que --force/--reason en
-# scripts/route/scripts/session. Sin restricción por archivo tocado:
+# scripts/route. Sin restricción por archivo tocado:
 # la justificación es la salvaguarda, no una lista de paths permitidos.
 if [ "$spec_id" = "none" ]; then
   reason_raw="$(grep -m1 '^Spec-Id-Reason:' "$MSG_FILE" | sed 's/^Spec-Id-Reason:[[:space:]]*//' || true)"

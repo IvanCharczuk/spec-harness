@@ -315,8 +315,10 @@ ca_superados_lookup() {
 
 # Valida una entrada del registro (RF-01): el CA existe en §6 de la spec que
 # se está verificando (el propio "$file") y "superado_por" existe en
-# specs/ y está verified o implementing. Imprime el motivo del rechazo en
-# stdout y devuelve 1 si es inválida; stdout vacío y 0 si es válida.
+# specs/ y está verified, implementing o superseded (RF-09 de 0098: la spec
+# que superó un CA lo sigue siendo aunque después la reemplacen). Imprime el
+# motivo del rechazo en stdout y devuelve 1 si es inválida; stdout vacío y 0
+# si es válida.
 ca_superados_validate() {
   local ca="$1" superado_por="$2" file="$3" sp_file sp_status
   if ! ca_ids "$file" | grep -qxF "$ca"; then
@@ -329,9 +331,9 @@ ca_superados_validate() {
   fi
   sp_status="$(fm_field "$sp_file" status)"
   case "$sp_status" in
-    verified|implementing) return 0 ;;
+    verified|implementing|superseded) return 0 ;;
     *)
-      printf 'superado_por %s no está verified/implementing (status=%s)' "$superado_por" "$sp_status"
+      printf 'superado_por %s no está verified/implementing/superseded (status=%s)' "$superado_por" "$sp_status"
       return 1
       ;;
   esac
@@ -364,4 +366,22 @@ pct_ratio() {
   local n="$1" d="$2"
   if [ "$d" -eq 0 ]; then echo 0; return; fi
   echo $(( (n * 100 + d / 2) / d ))
+}
+
+# --- RF-08 de specs/0093: árbol sucio tras un check ---------------------------
+# Mejor esfuerzo: un archivo que ya estaba modificado (` M`) y vuelve a
+# cambiar no se detecta. Todo termina en `|| true` (set -euo pipefail) y fuera
+# de un repo git devuelve vacío. Sólo strings, sin arrays (bash 3.2).
+
+# `git status --porcelain` del árbol, sin tomar locks opcionales.
+tree_status() {
+  git -C "$REPO_ROOT" --no-optional-locks status --porcelain 2>/dev/null || true
+}
+
+# <antes> <despues>: rutas que aparecen en despues y no en antes, separadas
+# por ", ". Vacío si no hay ninguna.
+tree_new_paths() {
+  local before="$1" after="$2"
+  comm -13 <(printf '%s\n' "$before" | sort) <(printf '%s\n' "$after" | sort) 2>/dev/null \
+    | cut -c4- | awk 'NF { printf "%s%s", (n++ ? ", " : ""), $0 } END { if (n) printf "\n" }' || true
 }

@@ -73,20 +73,18 @@ no `bug`.
 
 ## Límites
 
-- Sólo lectura: `Bash` para correr `check:` de la spec y lecturas. Nunca
-  `Edit` ni `Write`.
-- Nunca ejecutás acciones irreversibles ni tocás el working tree ajeno:
-  nada de `git push`, `git stash`, `git checkout -- <archivo>`,
-  `git restore`, `git reset
-  --hard`, `rm -rf`, ni edición de hooks, config o credenciales.
-- Si un `check:` hace `git checkout`, `git stash` u otro comando de RF-01
-  de `spec 0035 (not in this snapshot)`
-  (aunque sea en un clon temporal), corrélo con `scripts/verify <id> --ca <CA>`,
-  no copiado a mano: el `deny` lo bloquea y está bien que lo bloquee.
+- Sólo lectura: `Bash` para correr `check:` de la spec y lecturas; nunca `Edit` ni `Write`.
+- Nunca commiteás ni hacés `git push`; lo destructivo de git (`git checkout`, `git stash`, `git reset --hard`) lo bloquea el `deny` de `.claude/settings.json`, y si un `check:` lo usa se corre con `scripts/verify <id> --ca <CA>`, nunca a mano.
+- `rm -rf` sólo dentro de `.state/`; nada de hooks, credenciales ni config fuera del §Alcance.
+- Si la tarea excede el §Alcance de la spec, parás y lo reportás: no seguís de largo.
+
+## Notas
 
 Para comparar con una versión anterior usá `git show <commit>:<ruta>` o
 `git diff`, nunca un checkout: el working tree tiene el trabajo de otros
 agentes que corren en paralelo y no se puede restaurar.
+
+## Salida
 
 Tu texto final es el veredicto con su evidencia (es el valor de retorno del
 workflow). Si te dieron un schema, respetalo.

@@ -23,7 +23,6 @@ schema_change: false
 arch_decision: false
 target_branch: "spec/0000-slug"
 loc_estimate: 0
-tier_locked: null
 supersedes: null
 ```
 
@@ -116,6 +115,10 @@ Binarios. La spec está cumplida si y sólo si los N pasan.
     cmd: "<comando>"
     expect_exit: 0
   ```
+
+Nota: en un `cmd:` de varias líneas, una negación que no es la última lleva
+`|| exit 1` (`! grep -q X f || exit 1`), porque bajo `set -e` un `! cmd` no
+corta. `scripts/spec lint` falla en draft/approved si falta.
 
 ---
 

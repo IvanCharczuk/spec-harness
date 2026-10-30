@@ -1,18 +1,5 @@
 # RNF-04 — pin exacto, prohibido rango abierto.
 node_range: "^22.19.0 || >=24.0.0"   # RNF-01, valor firme (definido en la spec)
 
-# Valor firme (§8.4 madre) — ver B-05: confirmado 27/08/2026 contra
-# registry.npmjs.org y contra github.com/deepseek-ai/deepseek-harness/tags
-# (tag dsh-v0.1.1-rc.2, 21/08/2026). Release candidate, no versión estable
-# (developer preview, B-05 madre).
-#
-# Intento de actualización a 0.1.2-rc.1 el 08/09/2026: revertido. El
-# build real de dsh-plugins/dsh-frontend/ (tsc --noEmit) rompió contra
-# esa versión — CommandResult.sourceEventSeq pasó de number a un tipo
-# nominal (branded) SessionSeq. No detectado en la verificación previa
-# porque sólo se habían chequeado 3 tipos puntuales, no el árbol
-# completo usado por el código real. Ver corrección en B-05 madre.
-dsh_version: "0.1.1-rc.2"
-
 # [SIN CONFIRMAR] — ver B-06 y docs.claude.com antes de fijar versión.
 claude_code_version: null

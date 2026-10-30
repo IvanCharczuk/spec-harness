@@ -26,14 +26,14 @@ All of this needs only `bash`, `git` and `node`:
 
 ## Parallel sessions
 
-One spec per worktree. Create it with `scripts/tmux-spec new <id>` (a tmux
-window with its own worktree and branch, named `spec/<id>-...`) or with
+One spec per worktree. Create it with `the worktree helper (not in this snapshot) new "<title>"` (a
+worktree with its own branch, named after the spec) or with
 `git worktree add` by hand. The agent works only in its worktree and branch;
 merging into `main` is always yours.
 
 ## What to try first on a new host
 
-1. `bash scripts/bootstrap` creates `.state/` and the profiles.
+1. `bash scripts/bootstrap` creates `.state/` and installs the git hooks.
 2. `scripts/rutas --lint` checks agents, workflows and profiles.
 3. Open a spec that is already `verified` and run `scripts/rmaestro <id>`: if it
    prints a `MODO=` line, the core works on that host.

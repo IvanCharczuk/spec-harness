@@ -1,0 +1,13 @@
+{
+  "plan": {
+    "enfoque": "enfoque que no debe llegar a RUTA_ARGS",
+    "diagrama": {"diagram_type": "sequence", "participants": [], "messages": []},
+    "grupos": [
+      {"id": "G1", "nombre": "scripts", "archivos": ["scripts/x"], "ca": ["CA-01"]},
+      {"id": "G2", "nombre": "docs", "archivos": ["docs/x.md"], "ca": ["CA-02"]}
+    ],
+    "casos_borde": ["plan vacio"],
+    "supuestos": ["node disponible"],
+    "otra_clave": 1
+  }
+}

@@ -1,7 +1,7 @@
-# SPEC — Fixture de prueba (session gate) — approved simple
+# SPEC — Fixture de prueba (lint)
 
 **Spec madre:** `specs/0001-repo-maestro.md`. Fixture de test para
-spec 0004 (not in this snapshot), no es una spec real.
+specs/0001-repo-maestro.md, no es una spec real.
 
 **Destinatario:** ninguno — fixture de test.
 
@@ -10,10 +10,10 @@ spec 0004 (not in this snapshot), no es una spec real.
 ---
 
 ```yaml
-id: "9103"
-title: "Fixture de prueba (session gate) — lint broken"
+id: "9006"
+title: "Fixture de prueba (lint) — superseded"
 version: 1
-status: approved
+status: superseded
 created_at: 2026-08-21
 updated_at: 2026-08-21
 schema_change: false
@@ -56,7 +56,7 @@ Fixture de test, sin contenido real.
 
 ---
 
-Estructura del entregable (sin heading, a propósito)
+## 5. Estructura del entregable
 
 Sin archivos reales.
 

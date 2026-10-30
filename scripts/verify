@@ -46,7 +46,7 @@ MAX_RATIO="$(yaml_field "$ROUTING_CONFIG" max_manual_ratio || true)"
 SELECTED_CAS=()
 if [ "${#CA_FILTER[@]}" -gt 0 ]; then
   all_cas="$(ca_ids "$FILE")"
-  for want in "${CA_FILTER[@]}"; do
+  for want in ${CA_FILTER[@]+"${CA_FILTER[@]}"}; do
     if ! printf '%s\n' "$all_cas" | grep -qxF "$want"; then
       echo "verify: $want no existe en §6 de $ID" >&2
       exit 2
@@ -54,7 +54,7 @@ if [ "${#CA_FILTER[@]}" -gt 0 ]; then
   done
   while IFS= read -r ca; do
     [ -z "$ca" ] && continue
-    for want in "${CA_FILTER[@]}"; do
+    for want in ${CA_FILTER[@]+"${CA_FILTER[@]}"}; do
       if [ "$ca" = "$want" ]; then
         SELECTED_CAS+=("$ca")
         break
@@ -75,6 +75,13 @@ fi
 FM_ID="$(fm_field "$FILE" id)"
 [ -n "$FM_ID" ] || FM_ID="$ID"
 
+# RF-07 de specs/0093: verify nunca escribe en el registro real; los checks
+# que registran sesiones (los de specs archivadas del legado) escriben en un temporal propio que se borra al
+# salir (mktemp sin argumentos: portable BSD/GNU; el trap no pisa el exit).
+SESSIONS_LOG="$(mktemp)" || SESSIONS_LOG=""
+[ -n "$SESSIONS_LOG" ] && export SESSIONS_LOG
+trap 'rm -f "${SESSIONS_LOG:-}"' EXIT
+
 total=0
 pass=0
 fail=0
@@ -87,7 +94,7 @@ ya_verde_count=0
 ROJO_REL="sessions/rojo/$FM_ID.txt"
 ROJO_FILE="$REPO_ROOT/$ROJO_REL"
 
-for ca in "${SELECTED_CAS[@]}"; do
+for ca in ${SELECTED_CAS[@]+"${SELECTED_CAS[@]}"}; do
   # RF-02 de specs/0046: un CA con entrada válida en el registro no corre
   # su check: y no cuenta como PASS ni FAIL (tampoco suma a CA_TOTAL ni a
   # manual_count — ver el comentario de decisión en lib/verify.sh).
@@ -106,7 +113,10 @@ for ca in "${SELECTED_CAS[@]}"; do
   fi
 
   total=$((total + 1))
+  # RF-08 de specs/0093: aviso (no falla) si el check ensució el árbol.
+  tree_before="$(tree_status)"
   result="$(evaluate_ca "$FILE" "$ca")"
+  tree_after="$(tree_status)"
   status="$(printf '%s' "$result" | cut -f1)"
   category="$(printf '%s' "$result" | cut -f2)"
   detail="$(printf '%s' "$result" | cut -f3)"
@@ -131,6 +141,10 @@ for ca in "${SELECTED_CAS[@]}"; do
     else
       printf '[FAIL] %s%s\n' "$ca" "$hint"
     fi
+  fi
+  new_paths="$(tree_new_paths "$tree_before" "$tree_after")"
+  if [ -n "$new_paths" ]; then
+    printf '[AVISO] %s dejó cambios en el árbol: %s\n' "$ca" "$new_paths"
   fi
 done
 

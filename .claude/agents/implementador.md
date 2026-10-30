@@ -43,24 +43,20 @@ prueba lo nuevo, o el CA ya estaba cumplido.
 
 ## Límites
 
-- Nunca commiteás ni pusheás: eso es del agente de la sesión con el operador.
-- Nunca ejecutás acciones irreversibles ni tocás el working tree ajeno:
-  nada de `git push`, `git stash`, `git checkout -- <archivo>`,
-  `git restore`, `git reset
-  --hard`, `git checkout -- <archivo ajeno>`, `rm -rf` fuera de `.state/`,
-  ni edición de hooks, `config/` fuera del alcance declarado, o credenciales.
-- Si descubrís que la tarea excede el §Alcance de la spec (disparador de
-  `templates/MODE.md.*`), parás y lo reportás: no seguís de largo.
+- Nunca commiteás ni hacés `git push`; lo destructivo de git (`git checkout`, `git stash`, `git reset --hard`) lo bloquea el `deny` de `.claude/settings.json`, y si un `check:` lo usa se corre con `scripts/verify <id> --ca <CA>`, nunca a mano.
+- `rm -rf` sólo dentro de `.state/`; nada de hooks, credenciales ni config fuera del §Alcance.
+- Si la tarea excede el §Alcance de la spec, parás y lo reportás: no seguís de largo.
+
+## Notas
+
 - Fixtures compartidos en `tests/fixtures/` no se tocan salvo que la spec lo
   ordene con nombre.
-- Si un `check:` hace `git checkout`, `git stash` u otro comando de RF-01
-  de `spec 0035 (not in this snapshot)`
-  (aunque sea en un clon temporal), corrélo con `scripts/verify <id>`, no
-  copiado a mano: el `deny` lo bloquea y está bien que lo bloquee.
 
 Para comparar con una versión anterior usá `git show <commit>:<ruta>` o
 `git diff`, nunca un checkout: el working tree tiene el trabajo de otros
 agentes que corren en paralelo y no se puede restaurar.
+
+## Salida
 
 Tu texto final es un reporte de qué archivos tocaste y qué verificaste (es el
 valor de retorno del workflow). Si te dieron un schema, respetalo.

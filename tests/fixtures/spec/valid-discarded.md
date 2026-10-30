@@ -1,7 +1,7 @@
-# SPEC — Fixture de prueba (session gate) — approved simple
+# SPEC — Fixture de prueba (lint)
 
 **Spec madre:** `specs/0001-repo-maestro.md`. Fixture de test para
-spec 0004 (not in this snapshot), no es una spec real.
+specs/0001-repo-maestro.md, no es una spec real.
 
 **Destinatario:** ninguno — fixture de test.
 
@@ -10,14 +10,14 @@ spec 0004 (not in this snapshot), no es una spec real.
 ---
 
 ```yaml
-id: "9101"
-title: "Fixture de prueba (session gate) — approved complex"
+id: "9005"
+title: "Fixture de prueba (lint) — discarded"
 version: 1
-status: approved
+status: discarded
 created_at: 2026-08-21
 updated_at: 2026-08-21
 schema_change: false
-arch_decision: true
+arch_decision: false
 target_branch: "sandbox/fixture"
 loc_estimate: 10
 tier_locked: null

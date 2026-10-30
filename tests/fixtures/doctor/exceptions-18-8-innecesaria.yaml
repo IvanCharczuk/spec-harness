@@ -1,0 +1,11 @@
+# Fixture de 0093 CA-04: 0070 está verified y siempre cumple RF-18.8, así que
+# su excepción es innecesaria y doctor tiene que dar FAIL.
+rf_18_8: [{spec: "0070", motivo: "prueba de innecesaria"}, {spec: "0019", motivo: "start del 14/09, anterior al registro sessions/rojo de 0070"}]
+rf_18_9: [{spec: "0043", motivo: "verificada como 0038 y renumerada a 0043 el 29/09"}]
+rf_18_10:
+  - commit: ba9aea0532717ca0f33a4c43a6ca3da3c220f3cd
+    fecha: 2026-08-25
+    motivo: "fix(0001) al propio check 18.10, anterior al hook commit-msg con trailer"
+  - commit: b1248bf2307cb750bce81358f4b16f205f9a64c5
+    fecha: 2026-08-21
+    motivo: "feat(0003) ciclo de vida de spec, mismo día que el bootstrap, antes del hook"

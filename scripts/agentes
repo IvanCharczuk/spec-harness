@@ -8,6 +8,8 @@
 //   scripts/agentes prompt --rol <rol> --spec <id|ruta> [--sin-herramientas] [--extra <archivo>]
 //   scripts/agentes pedir --agente ollama --prompt-file <f> --schema <f>
 //                         [--model <m>] [--url <u>]
+//   scripts/agentes refutar --spec <id|ruta> --ca <CA-NN> --agente <a>
+//                           [--model <m>] [--url <u>]   (RF-01 a RF-05 de 0089)
 //   scripts/agentes --lint
 //
 // Config: AGENTES_CONFIG=<path> (relativo al cwd) o <repo>/config/agentes.yaml.
@@ -17,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const PEDIR_TIMEOUT_MS = 180000; // RNF-05 de 0086
@@ -26,6 +29,7 @@ const USO = `uso:
   scripts/agentes generar [--check]
   scripts/agentes prompt --rol <rol> --spec <id|ruta> [--sin-herramientas] [--extra <archivo>]
   scripts/agentes pedir --agente ollama --prompt-file <f> --schema <f> [--model <m>] [--url <u>]
+  scripts/agentes refutar --spec <id|ruta> --ca <CA-NN> --agente <a> [--model <m>] [--url <u>]
   scripts/agentes --lint
 config: AGENTES_CONFIG=<path> o config/agentes.yaml
 `;
@@ -455,7 +459,15 @@ async function cmdPedir(argv) {
     if (e instanceof Salida) throw e;
     fallar(2, `el schema ${flags['--schema']} no es JSON`);
   }
+  const r = await pedirChat({ agente, model, url, prompt, schema });
+  process.stdout.write(`${JSON.stringify(r)}\n`);
+  return 0;
+}
 
+// Núcleo de `pedir`, sin tocar disco: lo comparten cmdPedir y cmdRefutar
+// (8.1 de 0089). Valida contra el schema; exit 3 (red) y 4 (respuesta) se
+// propagan como Salida.
+async function pedirChat({ agente, model, url, prompt, schema }) {
   const body = JSON.stringify({
     model,
     messages: [{ role: 'user', content: prompt }],
@@ -499,7 +511,487 @@ async function cmdPedir(argv) {
   }
   const err = validar(respuesta, schema, 'respuesta');
   if (err) fallar(4, `pedir: no cumple el schema: ${err}`);
-  process.stdout.write(`${JSON.stringify({ agente, model, respuesta, ms })}\n`);
+  return { agente, model, respuesta, ms };
+}
+
+// --- refutar (RF-01 a RF-05 de 0089) ---------------------------------------
+// El modelo (sin herramientas) propone comando + predicción; la allowlist vive
+// acá, en código (RNF-01); el comando lo corre este script, no el modelo.
+
+const REFUTAR_TOPE_MS = 60000; // RF-05
+const REFUTAR_MAX_BUFFER = 256 * 1024; // RF-05
+const REFUTAR_SALIDA_JSON = 4096; // RF-01.5
+const EXCLUDES_GREP = ['--exclude-dir=.git', '--exclude-dir=.state', '--exclude-dir=handoffs', '--exclude=.env', '--exclude=.env.*'];
+
+const SCHEMA_REFUTAR = {
+  type: 'object',
+  required: ['clase'],
+  properties: {
+    clase: { type: 'string', enum: ['bug', 'diseno_ca', 'sin_evidencia'] },
+    evidencia: { type: 'string' },
+    contradice: { type: 'string' },
+    comando: { type: 'array', items: { type: 'string' } },
+    espera: {
+      type: 'object',
+      properties: {
+        exit: { type: 'number' },
+        contiene: { type: 'string' },
+        no_contiene: { type: 'string' },
+      },
+    },
+  },
+};
+
+const ALLOWLIST_TEXTO = [
+  '- `scripts/verify <id> --ca <CA>`: exactamente el id y el CA de esta afirmación.',
+  '- `grep` con -n -i -F -E -w -x -c -l -r, -A/-B/-C <n> y -e <patrón>; un patrón y al menos una ruta.',
+  '- `sed -n <n>p <ruta>` o `sed -n <n>,<m>p <ruta>`.',
+  '- `cat <ruta>...`, `head -n <n> <ruta>...`, `tail -n <n> <ruta>...`, `wc -l|-c <ruta>...`.',
+  '- `git show|diff|log` con --oneline --stat --name-only -p -n <n> --, revs y rutas.',
+  '- Rutas relativas al repo; nunca `.git`, `.state`, `.env*` ni `sessions/handoffs`.',
+  '- Sin shell: nada de pipes, redirecciones, `;`, `&`, `$(...)` ni backticks. Un comando, un argv.',
+].join('\n');
+
+// El bloque de un CA: desde `- **CA-NN**` hasta el próximo `- **CA-` o `---`.
+function bloqueCa(texto, ca) {
+  const lineas = texto.split('\n');
+  const ini = new RegExp(`^- \\*\\*${ca}\\*\\*`);
+  let i = lineas.findIndex((l) => ini.test(l));
+  if (i < 0) return null;
+  const out = [lineas[i]];
+  for (i = i + 1; i < lineas.length; i++) {
+    if (/^- \*\*CA-/.test(lineas[i]) || /^---\s*$/.test(lineas[i])) break;
+    out.push(lineas[i]);
+  }
+  while (out.length && out[out.length - 1].trim() === '') out.pop();
+  return out.join('\n');
+}
+
+function armarPromptRefutar({ cuerpoRol, ca, id, bloque }) {
+  return (
+    `${cuerpoRol}\n` +
+    '\n## Esta afirmación\n\n' +
+    `${ca} pasa.\n\n` +
+    `Bloque del ${ca} en la spec${id ? ` ${id}` : ''}, textual:\n\n` +
+    `${bloque}\n` +
+    '\n## Cómo refutar en este modo\n\n' +
+    'No tenés herramientas: no podés leer archivos ni correr nada. Proponés UN comando de lectura y una ' +
+    'predicción falsable de su salida; lo corre `scripts/agentes refutar`, no vos, y compara la salida real ' +
+    'con tu predicción. Si se cumple, el CA queda refutado.\n' +
+    '\nSólo se corre un comando que cumpla la allowlist:\n\n' +
+    `${ALLOWLIST_TEXTO}\n` +
+    '\n## Formato de respuesta\n\n' +
+    'JSON con `clase` (`bug` | `diseno_ca` | `sin_evidencia`) y `evidencia` (string). ' +
+    'Si `clase` es `bug`, además:\n' +
+    `- \`contradice\`: una frase literal, copiada tal cual, del bloque del ${ca} de arriba.\n` +
+    '- `comando`: array de strings (argv; `comando[0]` es el programa).\n' +
+    '- `espera`: objeto con al menos uno de `exit` (número), `contiene` (string no vacío) o `no_contiene` ' +
+    '(string no vacío): lo que la salida real tendría que mostrar si el CA estuviera roto.\n'
+  );
+}
+
+// RF-02: validar() de pedir ignora items y condicionales; acá, a mano.
+// Devuelve un mensaje de error (exit 4) o null. Si ok, `resp.espera` queda
+// normalizada en la tercera posición del retorno vía normalizarEspera.
+function normalizarEspera(espera) {
+  if (espera === null || typeof espera !== 'object' || Array.isArray(espera)) return { error: 'espera no es un objeto' };
+  const out = {};
+  if (espera.exit !== undefined && espera.exit !== null) {
+    if (typeof espera.exit !== 'number' || !Number.isFinite(espera.exit)) return { error: 'espera.exit no es un número' };
+    out.exit = espera.exit;
+  }
+  for (const k of ['contiene', 'no_contiene']) {
+    const v = espera[k];
+    if (v === undefined || v === null || v === '') continue;
+    if (typeof v !== 'string') return { error: `espera.${k} no es un string` };
+    out[k] = v;
+  }
+  if (Object.keys(out).length === 0) return { error: 'espera no trae exit, contiene ni no_contiene válidos' };
+  return { espera: out };
+}
+
+function validarBug(resp) {
+  if (typeof resp.contradice !== 'string' || resp.contradice.trim() === '') return 'contradice no es un string no vacío';
+  if (!Array.isArray(resp.comando) || resp.comando.length === 0 || !resp.comando.every((x) => typeof x === 'string')) {
+    return 'comando no es un array no vacío de strings';
+  }
+  const n = normalizarEspera(resp.espera);
+  if (n.error) return n.error;
+  return null;
+}
+
+// --- allowlist (RF-03) -------------------------------------------------------
+
+const rechazo = (regla, motivo) => ({ ok: false, motivo: `allowlist regla ${regla}: ${motivo}` });
+const SUELTOS = new Set(['|', '||', ';', '&', '&&', '<', '>', '>>']);
+const DIGITOS = /^\d+$/;
+
+function segmentosProhibidos(rel) {
+  const segs = rel.split(path.sep).filter((s) => s !== '');
+  for (const s of segs) {
+    const b = s.toLowerCase();
+    if (b === '.git' || b === '.state' || b === '.env' || b.startsWith('.env.')) return s;
+  }
+  const bajo = segs.join('/').toLowerCase();
+  if (bajo === 'sessions/handoffs' || bajo.startsWith('sessions/handoffs/')) return 'sessions/handoffs';
+  return null;
+}
+
+// RF-03.3: léxico + realpath del ancestro existente (realpath falla con rutas
+// que no existen, p. ej. `../x`).
+function motivoRuta(p, ctx) {
+  if (p === '') return 'ruta vacía';
+  if (p[0] === '-') return `'${p}' parece una flag no permitida`;
+  const raiz = ctx.root;
+  const abs = path.resolve(raiz, p);
+  const relLex = path.relative(raiz, abs);
+  if (relLex === '..' || relLex.startsWith(`..${path.sep}`) || path.isAbsolute(relLex)) return `'${p}' cae fuera del repo`;
+  let prohibido = segmentosProhibidos(relLex);
+  if (prohibido) return `'${p}' cae en ${prohibido}`;
+  let ancestro = abs;
+  const cola = [];
+  for (;;) {
+    try {
+      fs.lstatSync(ancestro);
+      break;
+    } catch (e) {
+      const padre = path.dirname(ancestro);
+      if (padre === ancestro) return `'${p}' no se puede resolver`;
+      cola.unshift(path.basename(ancestro));
+      ancestro = padre;
+    }
+  }
+  let real;
+  try {
+    real = fs.realpathSync(ancestro);
+  } catch (e) {
+    return `'${p}' no se puede resolver (symlink roto)`;
+  }
+  real = path.join(real, ...cola);
+  const relReal = path.relative(raiz, real);
+  if (relReal === '..' || relReal.startsWith(`..${path.sep}`) || path.isAbsolute(relReal)) return `'${p}' resuelve fuera del repo`;
+  prohibido = segmentosProhibidos(relReal);
+  if (prohibido) return `'${p}' resuelve a ${prohibido}`;
+  return null;
+}
+
+function motivoRutas(rutas, ctx) {
+  for (const r of rutas) {
+    const m = motivoRuta(r, ctx);
+    if (m) return m;
+  }
+  return null;
+}
+
+function flagInvalida(a) {
+  return a.length > 0 && a[0] === '-';
+}
+
+function permGrep(args, ctx) {
+  const flags = [];
+  const posicionales = [];
+  let patron = null;
+  let rec = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '-e') {
+      if (i + 1 >= args.length) return rechazo(2, 'grep -e sin patrón');
+      if (patron !== null) return rechazo(2, 'grep admite un solo patrón');
+      patron = args[++i];
+    } else if (a === '-A' || a === '-B' || a === '-C') {
+      if (i + 1 >= args.length || !DIGITOS.test(args[i + 1])) return rechazo(2, `grep ${a} requiere un número`);
+      flags.push(a, args[++i]);
+    } else if (['-n', '-i', '-F', '-E', '-w', '-x', '-c', '-l', '-r'].includes(a)) {
+      flags.push(a);
+      if (a === '-r') rec = true;
+    } else if (flagInvalida(a)) {
+      return rechazo(2, `grep ${a} no está permitida`);
+    } else {
+      posicionales.push(a);
+    }
+  }
+  let rutas = posicionales;
+  if (patron === null) {
+    if (posicionales.length === 0) return rechazo(2, 'grep sin patrón');
+    patron = posicionales[0];
+    rutas = posicionales.slice(1);
+  }
+  if (rutas.length === 0) return rechazo(2, 'grep sin ruta');
+  const m = motivoRutas(rutas, ctx);
+  if (m) return rechazo(3, m);
+  return { ok: true, argv: ['grep', ...flags, ...(rec ? EXCLUDES_GREP : []), '-e', patron, ...rutas] };
+}
+
+function permSed(args, ctx) {
+  if (args.length !== 3 || args[0] !== '-n' || !/^\d+(,\d+)?p$/.test(args[1])) {
+    return rechazo(2, 'sed sólo admite -n <n>p|<n>,<m>p <ruta>');
+  }
+  const m = motivoRutas([args[2]], ctx);
+  if (m) return rechazo(3, m);
+  return { ok: true, argv: ['sed', ...args] };
+}
+
+// cat, head, tail, wc: flags opcionales al principio y al menos una ruta.
+function permLectura(prog, args, ctx) {
+  let i = 0;
+  const flags = [];
+  if (prog === 'head' || prog === 'tail') {
+    if (args[0] === '-n') {
+      if (args.length < 2 || !DIGITOS.test(args[1])) return rechazo(2, `${prog} -n requiere un número`);
+      flags.push('-n', args[1]);
+      i = 2;
+    }
+  } else if (prog === 'wc') {
+    while (i < args.length && (args[i] === '-l' || args[i] === '-c')) flags.push(args[i++]);
+  }
+  const rutas = args.slice(i);
+  if (rutas.length === 0) return rechazo(2, `${prog} sin ruta`);
+  for (const r of rutas) {
+    if (flagInvalida(r)) return rechazo(2, `${prog} ${r} no está permitida`);
+  }
+  const m = motivoRutas(rutas, ctx);
+  if (m) return rechazo(3, m);
+  return { ok: true, argv: [prog, ...flags, ...rutas] };
+}
+
+function esRutaGit(tok, ctx) {
+  if (tok === '.' || tok === '..' || tok[0] === '/' || tok.startsWith('./') || tok.startsWith('../')) return true;
+  try {
+    fs.lstatSync(path.resolve(ctx.root, tok));
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function permGit(args, ctx) {
+  const sub = args[0];
+  if (sub !== 'show' && sub !== 'diff' && sub !== 'log') return rechazo(2, `git ${sub === undefined ? '' : sub} no está permitido (sólo show, diff y log)`);
+  const out = [];
+  let sep = false;
+  for (let i = 1; i < args.length; i++) {
+    const a = args[i];
+    if (sep) {
+      if (flagInvalida(a)) return rechazo(2, `git ${sub} ${a} no está permitida`);
+      const m = motivoRuta(a, ctx);
+      if (m) return rechazo(3, m);
+      out.push(a);
+    } else if (a === '--') {
+      sep = true;
+      out.push(a);
+    } else if (['--oneline', '--stat', '--name-only', '-p'].includes(a)) {
+      out.push(a);
+    } else if (a === '-n') {
+      if (i + 1 >= args.length || !DIGITOS.test(args[i + 1])) return rechazo(2, `git ${sub} -n requiere un número`);
+      out.push(a, args[++i]);
+    } else if (flagInvalida(a)) {
+      return rechazo(2, `git ${sub} ${a} no está permitida`);
+    } else {
+      const c = a.indexOf(':');
+      let m = null;
+      if (c >= 0) {
+        if (!/^[A-Za-z0-9_.\/@{}~^+,-]*$/.test(a.slice(0, c))) return rechazo(2, `rev '${a}' no permitida`);
+        m = motivoRuta(a.slice(c + 1), ctx);
+      } else if (esRutaGit(a, ctx)) {
+        m = motivoRuta(a, ctx);
+      } else if (!/^[A-Za-z0-9_.\/@{}~^+,-]+$/.test(a)) {
+        return rechazo(2, `rev '${a}' no permitida`);
+      }
+      if (m) return rechazo(3, m);
+      out.push(a);
+    }
+  }
+  return { ok: true, argv: ['git', sub, '--no-ext-diff', '--no-textconv', ...out] };
+}
+
+// RF-03: ctx = { id, ca, root } (root ya con realpath). Devuelve
+// { ok: true, argv } (argv final, con lo que refutar inyecta) o
+// { ok: false, motivo }.
+function permitido(argv, ctx) {
+  for (const a of argv) {
+    if (/[\n\r\0]/.test(a)) return rechazo(1, 'un elemento trae salto de línea o NUL');
+    if (a.startsWith('$(') || a.startsWith('`')) return rechazo(1, `'${a}' empieza con una sustitución de comando`);
+    if (SUELTOS.has(a)) return rechazo(1, `'${a}' suelto: no hay shell`);
+  }
+  const prog = argv[0];
+  const args = argv.slice(1);
+  switch (prog) {
+    case 'scripts/verify':
+      if (!ctx.id || args.length !== 3 || args[0] !== ctx.id || args[1] !== '--ca' || args[2] !== ctx.ca) {
+        return rechazo(2, `scripts/verify sólo con '${ctx.id || '<id>'} --ca ${ctx.ca}'`);
+      }
+      return { ok: true, argv: [...argv] };
+    case 'grep':
+      return permGrep(args, ctx);
+    case 'sed':
+      return permSed(args, ctx);
+    case 'cat':
+    case 'head':
+    case 'tail':
+    case 'wc':
+      return permLectura(prog, args, ctx);
+    case 'git':
+      return permGit(args, ctx);
+    default:
+      return rechazo(2, `'${prog}' no está en la allowlist`);
+  }
+}
+
+// --- derivación (RF-04) ------------------------------------------------------
+
+// Pura. `accion.ejecutar` es el argv final si hay que correr algo.
+function derivar(resp, bloque, ctx) {
+  const base = { clase: resp.clase, refutado: false, escalado: false, motivo: null, ejecutar: null };
+  if (resp.clase !== 'bug') return base;
+  if (!bloque.includes(resp.contradice)) {
+    return { ...base, clase: 'sin_evidencia', motivo: 'contradice no está en el CA' };
+  }
+  const p = permitido(resp.comando, ctx);
+  if (!p.ok) return { ...base, escalado: true, motivo: p.motivo };
+  return { ...base, ejecutar: p.argv };
+}
+
+// Pura. `corrida` = { exit, salida, motivo } de ejecutar().
+function veredictoCorrida(espera, corrida) {
+  if (corrida.motivo) return { clase: 'sin_evidencia', refutado: false, motivo: corrida.motivo };
+  let cumple = true;
+  if (espera.exit !== undefined && corrida.exit !== espera.exit) cumple = false;
+  if (espera.contiene !== undefined && !corrida.salida.includes(espera.contiene)) cumple = false;
+  if (espera.no_contiene !== undefined && corrida.salida.includes(espera.no_contiene)) cumple = false;
+  return cumple
+    ? { clase: 'bug', refutado: true, motivo: 'la predicción se cumplió' }
+    : { clase: 'sin_evidencia', refutado: false, motivo: 'la predicción no se cumplió' };
+}
+
+// --- ejecución (RF-05) -------------------------------------------------------
+
+function topeMs() {
+  const e = Number(process.env.AGENTES_REFUTAR_TOPE_MS);
+  // Sólo puede BAJAR el tope: nunca se sube por entorno.
+  return Number.isFinite(e) && e > 0 ? Math.min(Math.floor(e), REFUTAR_TOPE_MS) : REFUTAR_TOPE_MS;
+}
+
+function ejecutar(argv) {
+  const tope = topeMs();
+  const bin = argv[0] === 'scripts/verify' ? path.join(REPO_ROOT, 'scripts', 'verify') : argv[0];
+  const env = {};
+  for (const k of ['PATH', 'HOME', 'LANG']) {
+    if (process.env[k] !== undefined) env[k] = process.env[k];
+  }
+  return new Promise((resolve) => {
+    let hecho = false;
+    let timer = null;
+    let child = null;
+    const fin = (r) => {
+      if (hecho) return;
+      hecho = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
+    const matar = () => {
+      try {
+        process.kill(-child.pid, 'SIGKILL'); // grupo propio (detached): también los nietos
+      } catch (e) {
+        try {
+          child.kill('SIGKILL');
+        } catch (e2) {
+          // ya terminó
+        }
+      }
+    };
+    const out = [];
+    const err = [];
+    let total = 0;
+    let excedido = false;
+    const juntar = () => Buffer.concat([...out, ...err]).toString('utf8');
+    // sin shell; stdin cerrado (/dev/null)
+    child = spawn(bin, argv.slice(1), { cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+    const recibir = (lista) => (b) => {
+      if (excedido) return;
+      total += b.length;
+      lista.push(b);
+      if (total > REFUTAR_MAX_BUFFER) {
+        excedido = true;
+        matar();
+        fin({ exit: null, salida: juntar(), motivo: `tope de salida superado (${REFUTAR_MAX_BUFFER / 1024} KB)` });
+      }
+    };
+    child.stdout.on('data', recibir(out));
+    child.stderr.on('data', recibir(err));
+    child.on('error', (e) => {
+      const cod = (e && e.code) || 'error';
+      fin({ exit: null, salida: '', motivo: cod === 'ENOENT' ? `el programa '${argv[0]}' no existe (ENOENT)` : `no se pudo ejecutar '${argv[0]}' (${cod})` });
+    });
+    child.on('close', (code) => {
+      fin({ exit: typeof code === 'number' ? code : null, salida: juntar(), motivo: null });
+    });
+    timer = setTimeout(() => {
+      matar();
+      fin({ exit: null, salida: juntar(), motivo: `tope de tiempo superado (${tope} ms)` });
+    }, tope);
+  });
+}
+
+function recortar(s, bytes) {
+  const b = Buffer.from(s, 'utf8');
+  return b.length <= bytes ? s : b.subarray(0, bytes).toString('utf8');
+}
+
+async function cmdRefutar(argv) {
+  const inicio = Date.now();
+  const flags = parseFlags(argv, ['--spec', '--ca', '--agente', '--model', '--url'], []);
+  if (!flags['--spec'] || !flags['--ca'] || !flags['--agente']) {
+    fallar(2, `refutar requiere --spec, --ca y --agente\n${USO}`);
+  }
+  const ca = flags['--ca'];
+  if (!/^CA-\d+$/.test(ca)) fallar(2, `--ca '${ca}' no cumple CA-NN`);
+  const cfg = cargarConfig();
+  const agentes = seccion(cfg, 'agentes') || {};
+  const agente = flags['--agente'];
+  if (!Object.prototype.hasOwnProperty.call(agentes, agente)) fallar(2, `agente desconocido '${agente}'`);
+  const meta = agentes[agente];
+  if (!meta || meta.tools !== false) fallar(2, `refutar sólo admite agentes con tools: false, no '${agente}'`);
+  const model = flags['--model'] !== undefined ? flags['--model'] : meta.model;
+  const url = flags['--url'] !== undefined ? flags['--url'] : meta.url;
+  if (typeof model !== 'string' || model === '') fallar(2, `agentes.${agente}: falta model`);
+  if (typeof url !== 'string' || url === '') fallar(2, `agentes.${agente}: falta url`);
+
+  const specRel = resolverSpec(flags['--spec']);
+  const bloque = bloqueCa(fs.readFileSync(path.join(REPO_ROOT, specRel), 'utf8'), ca);
+  if (bloque === null) fallar(2, `la spec ${specRel} no tiene ${ca}`);
+  const idm = /^(\d{4})-/.exec(path.basename(specRel));
+  const id = idm ? idm[1] : null;
+  const cuerpoRol = leerRol('refutador').toString('utf8');
+  const prompt = armarPromptRefutar({ cuerpoRol, ca, id, bloque });
+
+  const { respuesta } = await pedirChat({ agente, model, url, prompt, schema: SCHEMA_REFUTAR });
+
+  const sal = { ca, agente, model, clase: respuesta.clase, refutado: false, escalado: false, contradice: null, comando: null, espera: null, exit: null, salida: null, motivo: null, ms: 0 };
+  let espera = null;
+  if (respuesta.clase === 'bug') {
+    const errBug = validarBug(respuesta);
+    if (errBug) fallar(4, `refutar: la respuesta no cumple RF-02: ${errBug}`);
+    espera = normalizarEspera(respuesta.espera).espera;
+    sal.contradice = respuesta.contradice;
+    sal.comando = respuesta.comando;
+    sal.espera = espera;
+  }
+  const ctx = { id, ca, root: fs.realpathSync(REPO_ROOT) };
+  const d = derivar(respuesta, bloque, ctx);
+  sal.clase = d.clase;
+  sal.escalado = d.escalado;
+  sal.motivo = d.motivo;
+  if (d.ejecutar) {
+    const corrida = await ejecutar(d.ejecutar);
+    const v = veredictoCorrida(espera, corrida);
+    sal.clase = v.clase;
+    sal.refutado = v.refutado;
+    sal.motivo = v.motivo;
+    sal.exit = corrida.exit;
+    sal.salida = recortar(corrida.salida, REFUTAR_SALIDA_JSON);
+  }
+  sal.ms = Date.now() - inicio;
+  process.stdout.write(`${JSON.stringify(sal)}\n`);
   return 0;
 }
 
@@ -560,6 +1052,8 @@ async function main(argv) {
       return cmdPrompt(resto);
     case 'pedir':
       return cmdPedir(resto);
+    case 'refutar':
+      return cmdRefutar(resto);
     case '--lint':
       return cmdLint(resto);
     case '-h':
@@ -591,4 +1085,4 @@ if (require.main === module) {
   );
 }
 
-module.exports = { parseYaml, cargarConfig, configPath, validar, REPO_ROOT };
+module.exports = { parseYaml, cargarConfig, configPath, validar, derivar, permitido, REPO_ROOT };

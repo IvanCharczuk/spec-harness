@@ -293,7 +293,7 @@ run_stats() {
       status="$(fm_field "$f" status)"
       version="$(fm_int "$f" version 1)"
       case "$status" in
-        approved|implementing|verified|archived)
+        approved|implementing|verified|archived|superseded|discarded)
           rework_den=$((rework_den + 1))
           [ "$version" -gt 1 ] && rework_num=$((rework_num + 1))
           ;;

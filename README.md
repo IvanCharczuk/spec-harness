@@ -28,7 +28,7 @@ process around the session:
   that is incomplete or still has the template placeholders.
 - **Scope and escalation.** `AGENTS.md` says: read the active spec, do not exceed
   its scope, escalate as soon as a hard trigger or the complexity threshold is
-  crossed. `scripts/escalate` records it.
+  crossed.
 - **Red before green.** A criterion is "done" only when its check was seen
   failing first and passing after (`scripts/verify <id> --ca CA-NN`).
 - **Parallel work that does not collide.** One spec, one worktree, one branch.

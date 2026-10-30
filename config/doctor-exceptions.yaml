@@ -7,3 +7,7 @@ rf_18_10:
   - commit: b1248bf2307cb750bce81358f4b16f205f9a64c5
     fecha: 2026-08-21
     motivo: "feat(0003) ciclo de vida de spec, mismo día que el bootstrap, antes del hook"
+# Specs históricas sin registro vivo (0093). Si 0019 o 0043 cambian y pasan
+# a cumplir la regla, la excepción pasa a innecesaria y doctor da FAIL.
+rf_18_8: [{spec: "0019", motivo: "start del 14/09, anterior al registro sessions/rojo de 0070"}]
+rf_18_9: [{spec: "0043", motivo: "verificada como 0038 y renumerada a 0043 el 29/09"}]

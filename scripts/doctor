@@ -1,95 +1,54 @@
 #!/usr/bin/env bash
-# RF-18 — Doctor. 10 checks, cada uno con exit 0/1 individual; el script
-# devuelve 0 sólo si los 10 pasan.
+# RF-18 — Doctor. Checks 18.1, 18.5, 18.8, 18.9, 18.10 y 18.12, cada uno con
+# exit 0/1 individual; el script devuelve 0 sólo si pasan todos. 18.7 se sacó
+# en 0093; 18.2/.3/.4/.6/.11 y la parte de sesiones de 18.10, en 0096 (retiro
+# del legado tier/dsh).
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SELF_DIR/lib/common.sh"
+# shellcheck source=lib/spec.sh
+# (0093: fm_field; spec.sh sólo define funciones, sin efectos laterales)
+# 0098 también lo usa en el chequeo de reemplazos (RF-05).
+source "$SELF_DIR/lib/spec.sh"
 cd "$REPO_ROOT"
 EXCEPTIONS_FILE="config/doctor-exceptions.yaml"
-EXCEPTIONS_ARGC="$#"
-EXCEPTIONS_ARG1="${1:-}"
-EXCEPTIONS_ARG2="${2:-}"
 EXCEPTIONS_DETAIL=""
 
+# RF-03 de 0028: único argumento opcional `--exceptions <path>`. Sin
+# argumentos, EXCEPTIONS_FILE ya trae la ruta por defecto. Ruta inexistente
+# equivale a lista vacía. 0093: se parsea acá, antes de 18.8/18.9, que
+# también leen las excepciones.
+case "$#" in
+  0) : ;;
+  2)
+    if [ "${1:-}" = "--exceptions" ] && [ -n "${2:-}" ]; then
+      EXCEPTIONS_FILE="$2"
+    else
+      echo "uso: scripts/doctor [--exceptions <path>]" >&2
+      exit 2
+    fi
+    ;;
+  *)
+    echo "uso: scripts/doctor [--exceptions <path>]" >&2
+    exit 2
+    ;;
+esac
+
 FAILS=0
+PASSES=0
 
 fail_check() { print_fail "$1"; FAILS=$((FAILS + 1)); }
-pass_check() { print_pass "$1"; }
+# El total de la línea final sale de este contador, no de un número fijo
+# (0096): agregar o sacar un check no obliga a tocar el mensaje.
+pass_check() { print_pass "$1"; PASSES=$((PASSES + 1)); }
 
-# Resuelve el binario de dsh: instalación local del repo primero (elegida
-# deliberadamente para no tocar $PATH ni ~/.zshrc — ver §Historial de 0010),
-# global después. Imprime la ruta y devuelve 0 si encontró alguna.
-resolve_dsh() {
-  if [ -x "$REPO_ROOT/node_modules/.bin/dsh" ]; then
-    printf '%s\n' "$REPO_ROOT/node_modules/.bin/dsh"
-    return 0
-  fi
-  if command -v dsh >/dev/null 2>&1; then
-    command -v dsh
-    return 0
-  fi
-  return 1
-}
-
-# 1) Node dentro del rango soportado por dsh (RNF-01) ------------------------
+# 1) Node dentro del rango soportado (RNF-01) --------------------------------
 if check_node_range; then
   pass_check "RF-18.1 Node $(node_version_string) dentro del rango (^22.19.0 || >=24.0.0)"
 else
   fail_check "RF-18.1 Node $(node_version_string) fuera del rango (^22.19.0 || >=24.0.0)"
-fi
-
-# 2) Versión de dsh pineada == instalada --------------------------------------
-pinned_dsh="$(yaml_field "$REPO_ROOT/config/versions.yaml" dsh_version || true)"
-if ! dsh_bin="$(resolve_dsh)"; then
-  fail_check "RF-18.2 dsh no instalado, ni local (node_modules/.bin/dsh) ni global (pin: ${pinned_dsh:-null})"
-elif [ -z "$pinned_dsh" ] || [ "$pinned_dsh" = "null" ]; then
-  fail_check "RF-18.2 dsh instalado pero config/versions.yaml no tiene dsh_version pineada"
-else
-  installed_dsh="$("$dsh_bin" --version 2>/dev/null || echo unknown)"
-  if [ "$installed_dsh" = "$pinned_dsh" ]; then
-    pass_check "RF-18.2 dsh instalado == pin ($pinned_dsh)"
-  else
-    fail_check "RF-18.2 dsh instalado ($installed_dsh) != pin ($pinned_dsh)"
-  fi
-fi
-
-# 3) bin/claude-personal y bin/claude-work resuelven a binario ejecutable ----
-bin_ok=1
-for w in bin/claude-personal bin/claude-work; do
-  if [ ! -f "$REPO_ROOT/$w" ] || [ ! -x "$REPO_ROOT/$w" ]; then
-    bin_ok=0
-  fi
-done
-if [ "$bin_ok" -eq 1 ]; then
-  pass_check "RF-18.3 bin/claude-personal y bin/claude-work existen y son ejecutables"
-else
-  fail_check "RF-18.3 bin/claude-personal y/o bin/claude-work faltan o no son ejecutables"
-fi
-
-# 4) Los dos CLAUDE_CONFIG_DIR existen, distintos, ninguno symlink/subdir ----
-personal_dir="$(yaml_field "$REPO_ROOT/config/profiles/personal.yaml" claude_config_dir || true)"
-work_dir="$(yaml_field "$REPO_ROOT/config/profiles/work.yaml" claude_config_dir || true)"
-check4() {
-  [ -n "$personal_dir" ] && [ -n "$work_dir" ] || { echo "  faltan claude_config_dir en perfiles"; return 1; }
-  local p="$REPO_ROOT/$personal_dir" w="$REPO_ROOT/$work_dir"
-  [ -d "$p" ] || { echo "  no existe: $p"; return 1; }
-  [ -d "$w" ] || { echo "  no existe: $w"; return 1; }
-  [ -L "$p" ] && { echo "  es symlink: $p"; return 1; }
-  [ -L "$w" ] && { echo "  es symlink: $w"; return 1; }
-  local rp rw
-  rp="$(cd "$p" && pwd)"
-  rw="$(cd "$w" && pwd)"
-  [ "$rp" = "$rw" ] && { echo "  son el mismo directorio"; return 1; }
-  case "$rw" in "$rp"/*) echo "  work es subdirectorio de personal"; return 1;; esac
-  case "$rp" in "$rw"/*) echo "  personal es subdirectorio de work"; return 1;; esac
-  return 0
-}
-if check4; then
-  pass_check "RF-18.4 CLAUDE_CONFIG_DIR de ambos tiers existen, distintos, sin relación symlink/subdir"
-else
-  fail_check "RF-18.4 CLAUDE_CONFIG_DIR de ambos tiers no cumple aislamiento"
 fi
 
 # 5) Ningún archivo trackeado contiene material credencial -------------------
@@ -126,118 +85,136 @@ if [ "$check5_ok" -eq 1 ]; then
   pass_check "RF-18.5 ningún archivo trackeado matchea patrones heurísticos de credenciales; ni rutas absolutas versionadas fuera de specs/"
 fi
 
-# 6) Puertos de web UI distintos y bindeados a 127.0.0.1 ---------------------
-personal_port="$(yaml_field "$REPO_ROOT/config/profiles/personal.yaml" web_ui_port || true)"
-work_port="$(yaml_field "$REPO_ROOT/config/profiles/work.yaml" web_ui_port || true)"
-check6() {
-  [ -n "$personal_port" ] && [ -n "$work_port" ] || { echo "  faltan web_ui_port en perfiles"; return 1; }
-  [ "$personal_port" != "$work_port" ] || { echo "  mismo puerto en ambos perfiles: $personal_port"; return 1; }
-  if command -v lsof >/dev/null 2>&1; then
-    local port bind
-    for port in "$personal_port" "$work_port"; do
-      bind="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $9}')"
-      case "$bind" in
-        "") ;;                    # nadie escucha, nada que auditar
-        127.0.0.1:*|\[::1\]:*) ;; # bind correcto
-        *) echo "  puerto $port bindeado a $bind, no a 127.0.0.1"; return 1;;
-      esac
-    done
-  fi
-  return 0
+# exceptions_specs <archivo> <clave>: extrae rf_18_8/rf_18_9[] (0093), mismo
+# estilo que exceptions_commits: awk lineal, sin tocar scripts/lib. Lee la
+# línea de la clave y las indentadas siguientes hasta la próxima clave de
+# primer nivel; acepta `rf_18_8: [{spec: "0019", motivo: "..."}]` en una
+# línea o entradas `- spec:` indentadas. Imprime `id<TAB>motivo` por entrada
+# (motivo vacío si falta). Archivo inexistente o clave ausente = vacío.
+exceptions_specs() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 0
+  awk -v key="$key" '
+    /^[^[:space:]#][^:]*:/ { inkey = (index($0, key ":") == 1); if (inkey) { txt = txt " " $0 }; next }
+    /^[[:space:]]*#/ { next }
+    inkey && /^[[:space:]]+-[[:space:]]/ { txt = txt "}" $0; next }
+    inkey { txt = txt " " $0 }
+    END {
+      n = split(txt, parts, "}")
+      for (i = 1; i <= n; i++) {
+        if (!match(parts[i], /spec:[[:space:]]*"[^"]+"/)) continue
+        id = substr(parts[i], RSTART, RLENGTH)
+        sub(/^spec:[[:space:]]*"/, "", id); sub(/"$/, "", id)
+        mot = ""
+        if (match(parts[i], /motivo:[[:space:]]*"[^"]*"/)) {
+          mot = substr(parts[i], RSTART, RLENGTH)
+          sub(/^motivo:[[:space:]]*"/, "", mot); sub(/"$/, "", mot)
+        }
+        printf "%s\t%s\n", id, mot
+      }
+    }
+  ' "$file"
 }
-if check6; then
-  pass_check "RF-18.6 puertos $personal_port/$work_port distintos y sin bind expuesto detectado"
-else
-  fail_check "RF-18.6 puertos de web UI no cumplen RNF-02"
-fi
 
-# 7) Ningún plugin montado fuera de la allowlist ------------------------------
-if ! resolve_dsh >/dev/null; then
-  pass_check "RF-18.7 dsh no instalado, no hay plugins montados que auditar"
-else
-  # dsh instalado: los plugins montados viven en el package.json de cada
-  # profile bajo $DSH_HOME (campo dsh.profile.bundles), confirmado contra el
-  # código instalado el 08/09/2026. Sin allowlist definida todavía (RF-19
-  # pendiente), se reporta qué hay montado en vez de decir que no hay nada.
-  mounted=""
-  for profile_dir in "$REPO_ROOT"/.state/dsh/*/profiles/*/; do
-    [ -f "$profile_dir/package.json" ] || continue
-    bundles="$(grep -oE '"@[a-z0-9@/._-]+"' "$profile_dir/package.json" 2>/dev/null | tr -d '"' | sort -u | tr '\n' ' ' || true)"
-    [ -n "$bundles" ] && mounted="$mounted ${profile_dir#"$REPO_ROOT/"}: $bundles;"
-  done
-  if [ -z "$mounted" ]; then
-    pass_check "RF-18.7 dsh instalado, ningún profile con plugins montados todavía"
-  else
-    pass_check "RF-18.7 dsh instalado, plugins montados (allowlist pendiente de RF-19):$mounted"
-  fi
-fi
-
-# 8/9) specs implementing/verified tienen sesión/verify asociados -----------
+# 8/9) specs implementing/verified tienen registro vivo (0093) --------------
+# implementing: sessions/rojo/<id>.txt o línea "spec_id":"<id>" en
+# sessions/rutas.jsonl. verified: commit `spec(<id>): implementing → verified`
+# en git log. El id sale del front-matter (fm_field), no del nombre de
+# archivo; una spec sin front-matter reconocible (0001) se saltea.
+# Imprime el detalle por infractor y deja los ids en SPEC_BAD_IDS.
+SPEC_BAD_IDS=""
+SPEC_EXC_COUNT=0
 check_spec_state() {
-  local want_status="$1" desc="$2"
-  local rc=0 f id status
+  local want="$1" key="$2" label="$3"
+  local rc=0 f id st subjects="" have_git=0 ok viol="" exc_ids="" v eid emot
+  SPEC_BAD_IDS=""
+  SPEC_EXC_COUNT=0
+  if [ "$want" = "verified" ]; then
+    if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      have_git=1
+      subjects="$(git -C "$REPO_ROOT" log --format=%s 2>/dev/null || true)"
+    fi
+  fi
   for f in "$REPO_ROOT"/specs/*.md; do
     [ -f "$f" ] || continue
-    status="$(spec_frontmatter_field "$f" status || true)"
-    [ "$status" = "$want_status" ] || continue
-    id="$(spec_frontmatter_field "$f" id || true)"
-    [ -n "$id" ] || { echo "  $f en $want_status sin id en front-matter"; rc=1; continue; }
-    if [ "$want_status" = "implementing" ]; then
-      node -e '
-        const fs=require("fs");
-        const id=process.argv[1];
-        const path=process.argv[2];
-        if(!fs.existsSync(path)) process.exit(1);
-        const lines=fs.readFileSync(path,"utf8").split("\n").filter(Boolean);
-        const found=lines.some(l=>{try{return JSON.parse(l).spec_id===id}catch(e){return false}});
-        process.exit(found?0:1);
-      ' "$id" "$REPO_ROOT/sessions/index.jsonl" || { echo "  spec $id en implementing sin sesión en sessions/index.jsonl"; rc=1; }
-    else
-      node -e '
-        const fs=require("fs");
-        const id=process.argv[1];
-        const path=process.argv[2];
-        if(!fs.existsSync(path)) process.exit(1);
-        const lines=fs.readFileSync(path,"utf8").split("\n").filter(Boolean);
-        const found=lines.some(l=>{try{const o=JSON.parse(l);return o.spec_id===id&&o.verify_result==="pass"}catch(e){return false}});
-        process.exit(found?0:1);
-      ' "$id" "$REPO_ROOT/sessions/index.jsonl" || { echo "  spec $id en verified sin verify_result=pass registrado"; rc=1; }
+    st="$(fm_field "$f" status || true)"
+    [ "$st" = "$want" ] || continue
+    id="$(fm_field "$f" id || true)"
+    if [ -z "$id" ]; then
+      echo "  $f en $want sin id en front-matter"
+      rc=1
+      continue
     fi
+    ok=0
+    if [ "$want" = "implementing" ]; then
+      if [ -f "$REPO_ROOT/sessions/rojo/$id.txt" ] \
+         || grep -qF "\"spec_id\":\"$id\"" "$REPO_ROOT/sessions/rutas.jsonl" 2>/dev/null; then
+        ok=1
+      fi
+    else
+      if [ "$have_git" -eq 0 ]; then
+        echo "  $label sin historial git: no se puede comprobar $id"
+        return 1
+      fi
+      # Un solo git log capturado; awk index()==1 busca el prefijo (la flecha
+      # es UTF-8) sin grep -q en pipe, que con pipefail daría 141 por SIGPIPE.
+      if printf '%s\n' "$subjects" | awk -v p="spec($id): implementing → verified" 'index($0, p) == 1 { f = 1 } END { exit !f }'; then
+        ok=1
+      fi
+    fi
+    [ "$ok" -eq 1 ] || viol="$viol$id"$'\n'
   done
+
+  while IFS=$'\t' read -r eid emot; do
+    [ -n "$eid" ] || continue
+    if [ -z "$emot" ]; then
+      echo "  $label excepción inválida: $eid sin motivo"
+      rc=1
+      continue
+    fi
+    case $'\n'"$viol" in
+      *$'\n'"$eid"$'\n'*)
+        exc_ids="$exc_ids$eid"$'\n'
+        SPEC_EXC_COUNT=$((SPEC_EXC_COUNT + 1))
+        ;;
+      *)
+        echo "  $label excepción innecesaria: $eid ya cumple la regla"
+        rc=1
+        ;;
+    esac
+  done < <(exceptions_specs "$EXCEPTIONS_FILE" "$key")
+
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    case $'\n'"$exc_ids" in
+      *$'\n'"$v"$'\n'*) ;;
+      *)
+        if [ "$want" = "implementing" ]; then
+          echo "  spec $v en implementing sin sessions/rojo/$v.txt ni línea en sessions/rutas.jsonl"
+        else
+          echo "  spec $v en verified sin commit 'spec($v): implementing → verified'"
+        fi
+        SPEC_BAD_IDS="${SPEC_BAD_IDS:+$SPEC_BAD_IDS }$v"
+        rc=1
+        ;;
+    esac
+  done <<< "$viol"
   return $rc
 }
-if check_spec_state "implementing" "sesión asociada"; then
-  pass_check "RF-18.8 toda spec en implementing tiene sesión asociada (o no hay ninguna)"
+if check_spec_state "implementing" "rf_18_8" "RF-18.8"; then
+  pass_check "RF-18.8 toda spec en implementing tiene registro (sessions/rojo o rutas.jsonl; $SPEC_EXC_COUNT exceptuadas)"
 else
-  fail_check "RF-18.8 hay spec en implementing sin sesión asociada"
+  fail_check "RF-18.8 spec en implementing sin registro o excepción inválida${SPEC_BAD_IDS:+: $SPEC_BAD_IDS}"
 fi
-if check_spec_state "verified" "verify en verde"; then
-  pass_check "RF-18.9 toda spec en verified tiene verify en verde registrado (o no hay ninguna)"
+if check_spec_state "verified" "rf_18_9" "RF-18.9"; then
+  pass_check "RF-18.9 toda spec en verified tiene su commit implementing → verified ($SPEC_EXC_COUNT exceptuadas)"
 else
-  fail_check "RF-18.9 hay spec en verified sin verify en verde registrado"
+  fail_check "RF-18.9 spec en verified sin commit implementing → verified o excepción inválida${SPEC_BAD_IDS:+: $SPEC_BAD_IDS}"
 fi
 
-# 10) commits con trailer Spec-Id válido; sesiones con spec_id ---------------
+# 10) commits con trailer Spec-Id válido (0096: sin la parte de sesiones) ----
 check10_commits() {
-  # EXCEPTIONS_ARGC/ARG1/ARG2 (RF-03 de 0028): único argumento opcional
-  # `--exceptions <path>`. Sin argumentos, EXCEPTIONS_FILE ya trae la ruta
-  # por defecto seteada arriba. Ruta inexistente equivale a lista vacía
-  # (se valida más abajo con [ -f ]).
-  case "$EXCEPTIONS_ARGC" in
-    0) : ;;
-    2)
-      if [ "$EXCEPTIONS_ARG1" = "--exceptions" ] && [ -n "$EXCEPTIONS_ARG2" ]; then
-        EXCEPTIONS_FILE="$EXCEPTIONS_ARG2"
-      else
-        echo "uso: scripts/doctor [--exceptions <path>]" >&2
-        exit 2
-      fi
-      ;;
-    *)
-      echo "uso: scripts/doctor [--exceptions <path>]" >&2
-      exit 2
-      ;;
-  esac
+  # El argumento `--exceptions <path>` se parsea al principio del script (0093).
 
   # exceptions_commits: extrae rf_18_10[].commit del YAML de excepciones
   # (RF-01/02 de 0028), mismo estilo que yaml_list de scripts/rutas: awk
@@ -331,80 +308,86 @@ check10_commits() {
   EXCEPTIONS_DETAIL=" ($exc_count exceptuados por $EXCEPTIONS_FILE)"
   return $rc
 }
-check10_sessions() {
-  node -e '
-    const fs=require("fs");
-    const path=process.argv[1];
-    if(!fs.existsSync(path)) process.exit(0);
-    const lines=fs.readFileSync(path,"utf8").split("\n").filter(Boolean);
-    let bad=0;
-    for (const l of lines){ try{ const o=JSON.parse(l); if(!o.spec_id){bad++;} }catch(e){bad++;} }
-    process.exit(bad>0?1:0);
-  ' "$REPO_ROOT/sessions/index.jsonl"
-}
-commits_ok=1; sessions_ok=1
-check10_commits || commits_ok=0
-check10_sessions || sessions_ok=0
-if [ "$commits_ok" -eq 1 ] && [ "$sessions_ok" -eq 1 ]; then
-  pass_check "RF-18.10 cero commits sin trailer Spec-Id válido${EXCEPTIONS_DETAIL:-}; cero sesiones sin spec_id"
+if check10_commits; then
+  pass_check "RF-18.10 cero commits sin trailer Spec-Id válido${EXCEPTIONS_DETAIL:-}"
 else
-  fail_check "RF-18.10 hay commits sin trailer Spec-Id válido y/o sesiones sin spec_id"
+  fail_check "RF-18.10 hay commits sin trailer Spec-Id válido"
 fi
 
-# 11) cordis.patch.yml sincronizado con config/profiles/*.yaml (RF-18.11, ---
-#     agregado por spec 0010 (not in this snapshot) RF-11 — el generador es
-#     manual, este check es la mitigación de detección, no de prevención)
-check11_cordis_patch() {
-  local patch_file="$REPO_ROOT/dsh-plugins/dsh-frontend/cordis.patch.yml"
-  [ -f "$patch_file" ] || return 0
-
-  local personal_dir work_dir personal_abs work_abs
-  personal_dir="$(yaml_field "$REPO_ROOT/config/profiles/personal.yaml" claude_config_dir || true)"
-  work_dir="$(yaml_field "$REPO_ROOT/config/profiles/work.yaml" claude_config_dir || true)"
-  [ -n "$personal_dir" ] && [ -n "$work_dir" ] || { echo "  faltan claude_config_dir en perfiles"; return 1; }
-  personal_abs="$REPO_ROOT/$personal_dir"
-  work_abs="$REPO_ROOT/$work_dir"
-
-  # Parseo del formato EXACTO que scripts/generate-cordis-patch.ts escribe
-  # (RF-11 de 0010): providerName con 8 espacios, CLAUDE_CONFIG_DIR con 10
-  # espacios, siempre precedido por su providerName dentro del mismo bloque.
-  local pairs
-  pairs="$(awk '
-    /^        providerName: / { current=$0; sub(/^        providerName: */, "", current); next }
-    /^          CLAUDE_CONFIG_DIR: "/ {
-      val=$0
-      sub(/^          CLAUDE_CONFIG_DIR: "/, "", val)
-      sub(/"$/, "", val)
-      print current "=" val
-    }
-  ' "$patch_file")"
-
-  local patch_personal patch_work
-  patch_personal="$(printf '%s\n' "$pairs" | grep '^claude-code-personal=' | sed 's/^claude-code-personal=//')"
-  patch_work="$(printf '%s\n' "$pairs" | grep '^claude-code-work=' | sed 's/^claude-code-work=//')"
-
-  [ -n "$patch_personal" ] || { echo "  cordis.patch.yml no tiene entrada claude-code-personal reconocible"; return 1; }
-  [ -n "$patch_work" ] || { echo "  cordis.patch.yml no tiene entrada claude-code-work reconocible"; return 1; }
-
-  [ "$patch_personal" = "$personal_abs" ] || {
-    echo "  claude-code-personal en cordis.patch.yml ($patch_personal) != perfil actual ($personal_abs)"
-    return 1
-  }
-  [ "$patch_work" = "$work_abs" ] || {
-    echo "  claude-code-work en cordis.patch.yml ($patch_work) != perfil actual ($work_abs)"
-    return 1
-  }
-  return 0
-}
-if check11_cordis_patch; then
-  pass_check "RF-18.11 cordis.patch.yml sincronizado con config/profiles/*.yaml (o no existe todavía, nada que auditar)"
+# 12) scripts/agentes generar --check sin diferencias (RF-18.12, 0093) -------
+if [ -x "$REPO_ROOT/scripts/agentes" ]; then
+  out="$("$REPO_ROOT/scripts/agentes" generar --check 2>&1)"; rc=$?
 else
-  fail_check "RF-18.11 cordis.patch.yml desincronizado de config/profiles/*.yaml"
+  out="scripts/agentes no existe o no es ejecutable"; rc=1
 fi
+if [ "$rc" -eq 0 ]; then
+  pass_check "RF-18.12 agentes generar --check sin diferencias"
+else
+  printf '%s\n' "$out" | sed 's/^/  /'
+  fail_check "RF-18.12 agentes generar --check con diferencias (exit $rc)"
+fi
+
+# Reemplazos consistentes (RF-05 de specs/0001-repo-maestro.md)
+# (a) si una spec declara supersedes X y X existe, X está en superseded;
+# (b) una spec en superseded tiene un superseded_by que existe en specs/.
+# '' y 'null' cuentan como ausente. Si X no existe, (a) no aplica.
+check_reemplazos() {
+  local rc=0 f id st sup sup_file sup_st sb sb_file
+  for f in "$REPO_ROOT"/specs/*.md; do
+    [ -e "$f" ] || continue
+    id="$(fm_field "$f" id || true)"
+    [ -n "$id" ] || id="$(basename "$f" .md)"
+    sup="$(fm_field "$f" supersedes || true)"
+    if [ -n "$sup" ] && [ "$sup" != "null" ]; then
+      sup_file="$(ls "$REPO_ROOT"/specs/"$sup"-*.md 2>/dev/null | head -1 || true)"
+      if [ -n "$sup_file" ]; then
+        sup_st="$(fm_field "$sup_file" status || true)"
+        if [ "$sup_st" != "superseded" ]; then
+          echo "  $id declara supersedes $sup, que está en ${sup_st:-(sin status)}"
+          rc=1
+        fi
+      fi
+    fi
+    st="$(fm_field "$f" status || true)"
+    if [ "$st" = "superseded" ]; then
+      sb="$(fm_field "$f" superseded_by || true)"
+      if [ -z "$sb" ] || [ "$sb" = "null" ]; then
+        echo "  $id está en superseded sin superseded_by"
+        rc=1
+      else
+        sb_file="$(ls "$REPO_ROOT"/specs/"$sb"-*.md 2>/dev/null | head -1 || true)"
+        if [ -z "$sb_file" ]; then
+          echo "  $id está en superseded con superseded_by $sb, que no existe en specs/"
+          rc=1
+        fi
+      fi
+    fi
+  done
+  return $rc
+}
+if check_reemplazos; then
+  pass_check "RF-05 de 0098: reemplazos consistentes (supersedes ↔ superseded_by)"
+else
+  fail_check "RF-05 de 0098: reemplazos consistentes (supersedes ↔ superseded_by)"
+fi
+
+# Negaciones que no cortan (RF-04 de 0100): sólo aviso, no es un check.
+# shellcheck source=lib/negaciones.sh
+source "$SELF_DIR/lib/negaciones.sh"
+for f in "$REPO_ROOT"/specs/*.md; do
+  [ -e "$f" ] || continue
+  rel="specs/$(basename "$f")"
+  while IFS="$(printf '\t')" read -r n ca _; do
+    [ -n "$n" ] || continue
+    echo "[AVISO] negación que no corta: $rel:$n $ca"
+  done <<EOF2
+$(negaciones_sueltas "$f" || true)
+EOF2
+done
 
 echo
 if [ "$FAILS" -eq 0 ]; then
-  echo "doctor: 11/11 checks OK"
+  echo "doctor: $PASSES/$PASSES checks OK"
   exit 0
 else
   echo "doctor: $FAILS check(s) en FAIL"
